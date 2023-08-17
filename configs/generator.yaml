@@ -1,0 +1,32 @@
+batch_size: 4 #22
+n_workers: 16
+iterations: 20000000
+eval_every: 1
+accumulate_grad_batches: 1
+fp16: False
+clip_denoised: True
+ema_rate: 0.999
+
+lr: 1e-4
+wd: "0"
+
+fine_tune_from:
+schedule_sampler: uniform
+
+model:
+  use_y_conditioning: False
+  diffusion_steps: 1000
+
+dataset:
+  image_path: /Users/mariadrozdova/PycharmProjects/diffusion-for-sources-characterisation/toy_data/
+  label_path:
+  size: 128
+  n_classes: None
+  n_channels: 1
+  from_uv: False
+  real_data: False
+  power: 30
+  use_zeros: True
+
+
+comment: CASA_zero_power10
