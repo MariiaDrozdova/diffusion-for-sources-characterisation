@@ -674,7 +674,8 @@ class UNetModel(nn.Module):
             nn.SiLU(),
             linear(time_embed_dim, time_embed_dim),
         )
-
+        print(self.num_classes)
+        print(self.num_classes is not None)
         if self.num_classes is not None:
             self.label1_emb = nn.Linear(num_classes, time_embed_dim)
             self.label2_emb = nn.Linear(num_classes, time_embed_dim)

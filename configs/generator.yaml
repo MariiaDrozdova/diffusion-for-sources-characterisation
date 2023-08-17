@@ -1,4 +1,4 @@
-batch_size: 4 #22
+batch_size: 1 #22
 n_workers: 16
 iterations: 20000000
 eval_every: 1
@@ -18,15 +18,15 @@ model:
   diffusion_steps: 1000
 
 dataset:
-  image_path: /Users/mariadrozdova/PycharmProjects/diffusion-for-sources-characterisation/toy_data/
+  image_path: toy_data/
   label_path:
   size: 128
-  n_classes: None
+  n_classes:
   n_channels: 1
   from_uv: False
   real_data: False
-  power: 30
+  power: 2
   use_zeros: True
 
 
-comment: CASA_zero_power10
+comment: toy_run

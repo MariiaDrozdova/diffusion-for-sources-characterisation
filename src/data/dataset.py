@@ -6,8 +6,8 @@ from torch.utils.data import Dataset, Subset, DataLoader, ConcatDataset
 from torchvision import transforms
 
 class SkaDataset(Dataset):
-    DIRTY_NOISY_WO_PROCESSING = "dirty_noisy_wo_processing"
-    TRUE_WO_PROCESSING = "true_wo_processing"
+    DIRTY_NOISY_WO_PROCESSING = "dirty"
+    TRUE_WO_PROCESSING = "true"
 
     def __init__(self, folder_images, image_size, power, from_uv):
         self.path_images = folder_images
@@ -53,10 +53,10 @@ class SkaDataset(Dataset):
         # cutting the circle, the same one we have in dirty images from CASA
         #mask = np.load("dirty_mask.npy").reshape(-1, 512, 512)
         #true = true * mask
-
+        const = 0.00002960064
+        true=true/const
+        true = np.abs(true)
         true = (true) ** (1. / self.power)
-        const = (0.35247646411) ** (10.0 / self.power)
-        true = (true) / const
         true = (true - 0.5) / 0.5
 
         data = {}
@@ -90,7 +90,7 @@ class SkaDataset(Dataset):
 
 class MakeDataLoader:
     """Class that creates train, valid and test datasets/dataloaders"""
-    def __init__(self, folder_images, image_size, test_size=0.1,
+    def __init__(self, folder_images, image_size, test_size=0.5,
                 random_state=2, augmented=True, real_data=False, power=10,
                 from_uv=False, use_zeros=False):
 

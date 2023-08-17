@@ -66,28 +66,21 @@ def main(args) -> None:
 
         for j, batch in tqdm(enumerate(dl)):
 
-            im_in, lbl1, lbl2 = batch["true"], batch["magnitude"], batch["phase"]
+            im_in = batch["true"]
             im_in = im_in.to(device)
-            lbl1 = lbl1.to(device)
-            lbl2 = lbl2.to(device)
 
             dirty_noisy = batch["dirty_noisy"].to(device)
             filenames = batch["filename"]
             with torch.no_grad():
-                zero_label = torch.zeros_like(lbl1, device=device)
-                lbl1 = torch.cat([lbl1, zero_label], dim=0)
-                lbl2 = torch.cat([lbl2, zero_label], dim=0)
-
                 zero_label_noise = torch.zeros_like(dirty_noisy, device=device)
                 dirty_noisy = torch.cat([dirty_noisy, zero_label_noise], dim=0)
                 im_out = diffusion.p_sample_loop(
                     model_fn,
-                    cond=dirty_noisy,#.repeat(2,1,1,1),
+                    cond=dirty_noisy,
                     shape=shape,
                     device=device,
                     clip_denoised=True,
                     progress=False,
-                    model_kwargs={'y1': lbl1, 'y2': lbl2,},
                     cond_fn=None,
                 )[:args.batch_size]
                 lbl1 = lbl1[:args.batch_size]
@@ -107,24 +100,13 @@ def main(args) -> None:
             dirty_noisy_list.extend(torch_to_image_numpy(dirty_noisy))
             gt_sources_list.extend(filenames.cpu())
 
-            #if len(images) > 20:
-            #    break
-
-
-
         images = np.array(images)
         generated_images = np.array(generated_images)
-        labels1 = np.array(labels1)
-        labels2 = np.array(labels2)
-
         dirty_noisy_list = np.array(dirty_noisy_list)
         gt_sources_list = np.array(gt_sources_list)
 
         np.save(output_path / f'{names[i]}_images.npy', images)
         np.save(output_path / f'{names[i]}_generated_images.npy', generated_images)
-        np.save(output_path / f'{names[i]}_labels1.npy', labels1)
-        np.save(output_path / f'{names[i]}_labels2.npy', labels2)
-
         np.save(output_path / f'{names[i]}_dirty_noisy.npy', dirty_noisy_list)
         np.save(output_path / f'{names[i]}_gt_sources.npy', gt_sources_list)
 
