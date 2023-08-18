@@ -905,116 +905,116 @@ def update_dict(
     gt_sources,
     key
     ):
-            result, unmatched_nb = merge_pd_frames(gt_sources, filtered_predicted)
-            index_matched = result.index_predicted[:-unmatched_nb]
-            ##############################
-            # Metrics for entire dataset
-            ##############################
-            metrics_keys = ["purity", "completeness", "f1", "tp", "fp", "fn", "f1", "values"]
+    result, unmatched_nb = merge_pd_frames(gt_sources, filtered_predicted)
+    index_matched = result.index_predicted[:-unmatched_nb]
+    ##############################
+    # Metrics for entire dataset
+    ##############################
+    metrics_keys = ["purity", "completeness", "f1", "tp", "fp", "fn", "f1", "values"]
 
-            tp, fp, fn = compute_localization(result)
-            purity, completeness, f1= compute_purity_completeness_f1(tp, fn, fp)
-            values = result.dropna()
+    tp, fp, fn = compute_localization(result)
+    purity, completeness, f1= compute_purity_completeness_f1(tp, fn, fp)
+    values = result.dropna()
 
-            for metrics_key in metrics_keys:
-                final_metrics[key][metrics_key] = locals()[metrics_key]
-            ##############################
-            # Per SNR metrics
-            ##############################
-            metrics_keys = ["purity", "completeness", "nb_points", "snrs", "tp", "fp", "fn", "f1", "values"]
-            metrics_sources_aggregated_per_snr = {metrics_key: [] for metrics_key in metrics_keys}
+    for metrics_key in metrics_keys:
+        final_metrics[key][metrics_key] = locals()[metrics_key]
+    ##############################
+    # Per SNR metrics
+    ##############################
+    metrics_keys = ["purity", "completeness", "nb_points", "snrs", "tp", "fp", "fn", "f1", "values"]
+    metrics_sources_aggregated_per_snr = {metrics_key: [] for metrics_key in metrics_keys}
 
-            # Iterating over SNR values to compute metrics
-            for snrs in np.arange(1.0, 10.1, 0.5):
-                snrs_low=snrs-0.25
-                snrs_up=snrs+0.25
+    # Iterating over SNR values to compute metrics
+    for snrs in np.arange(1.0, 10.1, 0.5):
+        snrs_low=snrs-0.25
+        snrs_up=snrs+0.25
 
-                # Filtering ground truth sources based on SNR bounds
-                filtered_gt_sources = gt_sources[gt_sources["SNR"].between(snrs_low, snrs_up)]
-                result, _ = merge_pd_frames(filtered_gt_sources, filtered_predicted)
+        # Filtering ground truth sources based on SNR bounds
+        filtered_gt_sources = gt_sources[gt_sources["SNR"].between(snrs_low, snrs_up)]
+        result, _ = merge_pd_frames(filtered_gt_sources, filtered_predicted)
 
-                # Computing localization metrics
-                tp, fp, fn = compute_localization(
-                    result,
-                    filtering_for_fp=result["SNR_estimated_predicted"].between(
-                        snrs_low,
-                        snrs_up
-                    ) & ~result["index_predicted"].isin(index_matched[:-unmatched_nb])
-                )
-                purity, completeness, f1= compute_purity_completeness_f1(tp, fn, fp)
+        # Computing localization metrics
+        tp, fp, fn = compute_localization(
+            result,
+            filtering_for_fp=result["SNR_estimated_predicted"].between(
+                snrs_low,
+                snrs_up
+            ) & ~result["index_predicted"].isin(index_matched[:-unmatched_nb])
+        )
+        purity, completeness, f1= compute_purity_completeness_f1(tp, fn, fp)
 
-                nb_points = len(filtered_gt_sources)
-                values = result.dropna()
+        nb_points = len(filtered_gt_sources)
+        values = result.dropna()
 
-                # Aggregating metrics
-                for metrics_key in metrics_keys:
-                    metrics_sources_aggregated_per_snr[metrics_key].append(locals()[metrics_key])
+        # Aggregating metrics
+        for metrics_key in metrics_keys:
+            metrics_sources_aggregated_per_snr[metrics_key].append(locals()[metrics_key])
 
-            final_metrics[key]["snr"] = metrics_sources_aggregated_per_snr.copy()
-            ##############################
-            # Per normalized SNR metrics
-            ##############################
-            metrics_keys = ["purity", "completeness", "nb_points", "snrs", "tp", "fp", "fn", "f1", "values"]
-            metrics_sources_aggregated_per_snr = {metrics_key: [] for metrics_key in metrics_keys}
+    final_metrics[key]["snr"] = metrics_sources_aggregated_per_snr.copy()
+    ##############################
+    # Per normalized SNR metrics
+    ##############################
+    metrics_keys = ["purity", "completeness", "nb_points", "snrs", "tp", "fp", "fn", "f1", "values"]
+    metrics_sources_aggregated_per_snr = {metrics_key: [] for metrics_key in metrics_keys}
 
-            for snrs in np.arange(1.0, 7.1, 0.5):
-                snr_norm_low=snrs-0.25
-                snr_norm_up=snrs+0.25
-                filtered_gt_sources = gt_sources[gt_sources["SNR normalized"].between(snr_norm_low, snr_norm_up)]
-                #filtered_predicted = filtered_predicted[filtered_predicted["SNR_norm_estimated"].between(snr_norm_low, snr_norm_up)]
-                result, _ = merge_pd_frames(filtered_gt_sources, filtered_predicted)
-                tp, fp, fn = compute_localization(
-                    result,
-                    filtering_for_fp=result["SNR_norm_estimated_predicted"].between(
-                        snr_norm_low,
-                        snr_norm_up
-                    ) & ~result["index_predicted"].isin(index_matched[:-unmatched_nb])
-                )
-                purity, completeness, f1= compute_purity_completeness_f1(tp, fn, fp)
+    for snrs in np.arange(1.0, 7.1, 0.5):
+        snr_norm_low=snrs-0.25
+        snr_norm_up=snrs+0.25
+        filtered_gt_sources = gt_sources[gt_sources["SNR normalized"].between(snr_norm_low, snr_norm_up)]
+        #filtered_predicted = filtered_predicted[filtered_predicted["SNR_norm_estimated"].between(snr_norm_low, snr_norm_up)]
+        result, _ = merge_pd_frames(filtered_gt_sources, filtered_predicted)
+        tp, fp, fn = compute_localization(
+            result,
+            filtering_for_fp=result["SNR_norm_estimated_predicted"].between(
+                snr_norm_low,
+                snr_norm_up
+            ) & ~result["index_predicted"].isin(index_matched[:-unmatched_nb])
+        )
+        purity, completeness, f1= compute_purity_completeness_f1(tp, fn, fp)
 
-                nb_points = len(filtered_gt_sources)
-                values = result.dropna()
+        nb_points = len(filtered_gt_sources)
+        values = result.dropna()
 
-                # Aggregating metrics
-                for metrics_key in metrics_keys:
-                    metrics_sources_aggregated_per_snr[metrics_key].append(locals()[metrics_key])
+        # Aggregating metrics
+        for metrics_key in metrics_keys:
+            metrics_sources_aggregated_per_snr[metrics_key].append(locals()[metrics_key])
 
-            final_metrics[key]["snrnorm"] = metrics_sources_aggregated_per_snr
+    final_metrics[key]["snrnorm"] = metrics_sources_aggregated_per_snr
 
-            # Count the number of sources per image_idx
+    # Count the number of sources per image_idx
 
-            # Defining metrics keys
-            metrics_keys = ["purity", "completeness", "tp", "fp", "fn", "f1", "values"]
-            metrics_nb_sources = {metrics_key: [] for metrics_key in metrics_keys}
+    # Defining metrics keys
+    metrics_keys = ["purity", "completeness", "tp", "fp", "fn", "f1", "values"]
+    metrics_nb_sources = {metrics_key: [] for metrics_key in metrics_keys}
 
-            for fixed_sources_nb in [1,2,3,4,5]:
-                # Counting sources per image index
-                source_counts = gt_sources.groupby('image_idx').size()
+    for fixed_sources_nb in [1,2,3,4,5]:
+        # Counting sources per image index
+        source_counts = gt_sources.groupby('image_idx').size()
 
-                # Selecting image indices that have a fixed number of sources
-                images_with_fixed_sources = source_counts[source_counts == fixed_sources_nb].index
+        # Selecting image indices that have a fixed number of sources
+        images_with_fixed_sources = source_counts[source_counts == fixed_sources_nb].index
 
-                # Filtering data based on these image indices
-                filtered_data = filtered_predicted[filtered_predicted['image_idx'].isin(images_with_fixed_sources)]
-                filtered_gt_sources = gt_sources[gt_sources['image_idx'].isin(images_with_fixed_sources)]
+        # Filtering data based on these image indices
+        filtered_data = filtered_predicted[filtered_predicted['image_idx'].isin(images_with_fixed_sources)]
+        filtered_gt_sources = gt_sources[gt_sources['image_idx'].isin(images_with_fixed_sources)]
 
-                # Merging data frames for computing metrics
-                result, _ = merge_pd_frames(filtered_gt_sources, filtered_data)
+        # Merging data frames for computing metrics
+        result, _ = merge_pd_frames(filtered_gt_sources, filtered_data)
 
-                # Computing localization metrics
-                tp, fp, fn = compute_localization(result)
+        # Computing localization metrics
+        tp, fp, fn = compute_localization(result)
 
-                # Computing purity, completeness, and F1 score
-                purity, completeness, f1 = compute_purity_completeness_f1(tp, fn, fp)
+        # Computing purity, completeness, and F1 score
+        purity, completeness, f1 = compute_purity_completeness_f1(tp, fn, fp)
 
-                values = result.dropna()
+        values = result.dropna()
 
-                # Aggregating metrics
-                for metrics_key in metrics_keys:
-                    metrics_nb_sources[metrics_key].append(locals()[metrics_key])
+        # Aggregating metrics
+        for metrics_key in metrics_keys:
+            metrics_nb_sources[metrics_key].append(locals()[metrics_key])
 
-            final_metrics[key]["of_nbs"] = metrics_nb_sources
-            return final_metrics
+    final_metrics[key]["of_nbs"] = metrics_nb_sources
+    return final_metrics
 
 
 def compute_purity_completeness_f1(tp, fn, fp):
