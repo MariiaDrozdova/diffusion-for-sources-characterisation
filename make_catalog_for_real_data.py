@@ -114,7 +114,10 @@ def initialize_final_metrics(runs_per_sample):
 # Function to cluster points (ra, dec) within each image using DBSCAN
 def cluster_points(dataframe, image_idx, eps=5e-5):
     # Filter data for specific image
-    image_data = dataframe[dataframe["image_idx"] == image_idx]
+    if image_idx is not None:
+        image_data = dataframe[dataframe["image_idx"] == image_idx]
+    else:
+        image_data = dataframe
 
     # Apply DBSCAN
     clustering = DBSCAN(eps=eps, min_samples=2).fit(image_data[['ra', 'dec']])
@@ -433,8 +436,6 @@ def plot_generated_images(
             # fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(10,4))
         else:
             fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(14, 4))
-    elif np.sum(true - generated) != 0:
-        fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(18, 4))
     else:
         fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(18, 4))
 
@@ -454,20 +455,22 @@ def plot_generated_images(
     cbar.update_ticks()
 
     axes[1].set_title("true image")
-    im1 = axes[1].imshow(true)
+    if true is not None:
+        im1 = axes[1].imshow(true)
+        cbar = plt.colorbar(im1, ax=axes[1])
+        # Set the colorbar tick format
+        cbar.formatter = ticker.ScalarFormatter(useMathText=True)
+        cbar.formatter.set_powerlimits((-4, 4))
+        cbar.ax.yaxis.set_offset_position('left')
+        cbar.update_ticks()
     if clean_sources is not None:
         axes[1].scatter(clean_sources[:, 0], clean_sources[:, 1], s=90, c='none', marker="o", edgecolor='r',
                         linewidths=1)
     axes[1].set_xticks([])
     axes[1].set_yticks([])
-    cbar = plt.colorbar(im1, ax=axes[1])
-    # Set the colorbar tick format
-    cbar.formatter = ticker.ScalarFormatter(useMathText=True)
-    cbar.formatter.set_powerlimits((-4, 4))
-    cbar.ax.yaxis.set_offset_position('left')
-    cbar.update_ticks()
 
-    if np.sum(true - generated) != 0 or True:
+
+    if true is None or np.sum(true - generated) != 0:
         axes[2].set_title("predicted image")
         im2 = axes[2].imshow(generated)
         if generated_sources is not None:
@@ -613,10 +616,7 @@ class PredictedCatalog:
         self.noisy_im_filenames.sort()
 
         # ra, dec, SNR, SNR normalized, flux, major, minor
-        self.snr_extended = np.load(f"{self.dataset_folder}/sky_sources_snr_extended.npy", allow_pickle=True).item()
         self.additional_line=""
-
-        self.generated_images = self.images
 
     def load_header(self, key):
         # our basic train val and test sets. All headers are saved separately as pickle objects
@@ -646,21 +646,15 @@ class PredictedCatalog:
     def run_test_experiment(
             self,
             i,
-            nb_sources=None,
             verbose=False,
             visualization=False,
             apply_itransform=True,
-            SNR_fixed=None,
             save_fig=False,
-            SNR_normalized=False,
             aggr="median",
     ):
         # corresponding index from fits name
         sky_index = self.sky_indexes[i]
         key = self.sky_keys[sky_index]
-        true_sources = np.array(self.snr_extended[key])
-        im = np.load(self.true_folder + "/" + self.noisy_im_filenames[sky_index])
-        im = np.nan_to_num(im)
         noisy_im = im_reshape(self.noisy_input[i])  # np.load(noisy_folder + "/" + noisy_im_filenames[sky_index])
         repeat_images = self.runs_per_sample
         save_folder = self.folder
@@ -671,24 +665,6 @@ class PredictedCatalog:
         data["predicted_sources_from_true"] = []
         data["gt_sources"] = []
 
-        if nb_sources is not None:
-            if len(true_sources) != nb_sources:
-                data["fn"] = 0
-                # in this case it should not contribute to fn as the whole image is excluded
-                return data
-        if SNR_fixed is not None and not SNR_normalized:
-            if all(np.around(round_custom(true_sources[:, 2].reshape(-1, 1)), decimals=ROUND_SNR) != SNR_fixed):
-                data["fn"] = 0
-                # in this case it should not contribute to fn as the whole image is excluded
-
-                return data
-
-        if SNR_fixed is not None and SNR_normalized:
-            if all(np.around(round_custom(true_sources[:, 3].reshape(-1, 1)), decimals=ROUND_SNR) != SNR_fixed):
-                data["fn"] = 0
-                # in this case it should not contribute to fn as the whole image is excluded
-                # print(np.around(true_sources[:,3].reshape(-1,1), decimals=ROUND_SNR))
-                return data
 
         if verbose or visualization:
             print("============================================FINAL============================================")
@@ -696,24 +672,6 @@ class PredictedCatalog:
 
         # get pixel true coordinates
         wcs = self.load_wcs(key)
-
-        gt_sources = actro_to_pix(true_sources, wcs)
-
-        gt_sources_astro = np.hstack(
-            (
-                true_sources[:, :2],
-                true_sources[:, 4].reshape(-1, 1),  # flux
-                true_sources[:, 2].reshape(-1, 1),  # SNR
-                true_sources[:, 3].reshape(-1, 1),  # SNR normalized
-                0.5 * (true_sources[:, 5].reshape(-1, 1) + true_sources[:, 6].reshape(-1, 1)),  # major
-                true_sources[:, 6].reshape(-1, 1),  # nimor
-            )
-        )
-
-        true_sources = true_sources[(gt_sources[:, 0] >= 0) & (gt_sources[:, 0] <= 512) &
-                                    (gt_sources[:, 1] >= 0) & (gt_sources[:, 1] <= 512)]
-        gt_sources_astro = gt_sources_astro[(gt_sources[:, 0] >= 0) & (gt_sources[:, 0] <= 512) &
-                                            (gt_sources[:, 1] >= 0) & (gt_sources[:, 1] <= 512)]
 
         gen_ims = []
         sources_from_generated_all_runs = []
@@ -739,10 +697,6 @@ class PredictedCatalog:
             if sources_from_generated is not None:
                 sources_from_generated_all_runs.append(sources_from_generated)
 
-            reconstruction_metrics_generated = compute_reconstruction_metrics_from_im(gen_im_astro, im, power=self.runs_per_sample)
-            reconstruction_metrics_generated = reconstruction_metrics_generated + [j, ]
-            reconstruction_metrics_generated_all_runs.append(reconstruction_metrics_generated)
-
             gen_ims.append(gen_im)
         if len(gen_ims) == 0:
             gen_ims = [gen_im, ]
@@ -754,9 +708,6 @@ class PredictedCatalog:
         if apply_itransform:
             gen_im_astro = true_itrasnform(gen_im, self.power)
 
-        sources_from_true_pix = image_to_sources(im)
-        sources_from_true = pix_to_astro(sources_from_true_pix, wcs)
-
         sources_from_generated_pix = image_to_sources(gen_im_astro)
         sources_from_generated = pix_to_astro(sources_from_generated_pix, wcs)
 
@@ -766,16 +717,7 @@ class PredictedCatalog:
         if sources_from_generated is not None:
             sources_from_generated_all_runs.append(sources_from_generated)
 
-        reconstruction_metrics_generated = compute_reconstruction_metrics_from_im(gen_im_astro, im, verbose=False, power=self.runs_per_sample)
-        reconstruction_metrics_generated = reconstruction_metrics_generated + [-1, ]
-        reconstruction_metrics_generated_all_runs.append(reconstruction_metrics_generated)
-        reconstruction_metrics_generated_all_runs = np.array(reconstruction_metrics_generated_all_runs)
-
         if verbose:
-            # Create a DataFrame
-            df = pd.DataFrame(gt_sources_astro, columns=casa_columns)
-            display(df)
-
             # Create a DataFrame
             if sources_from_generated is not None:
                 df = pd.DataFrame(sources_from_generated, columns=astropy_columns + ["diffusion_idx", ])
@@ -783,24 +725,16 @@ class PredictedCatalog:
             else:
                 print("No sources from generated")
 
-            # Create a DataFrame
-            if sources_from_true is not None:
-                df = pd.DataFrame(sources_from_true, columns=astropy_columns)
-                display(df)
-            else:
-                print("No sources from true")
-
-
         if verbose or visualization:
             plot_generated_images(
-                true_trasnform(im, self.power),
+                None,
                 true_trasnform(gen_im_astro, self.power),
                 noisy_im,
                 uncertainty,
-                sources=[sources_from_true_pix, sources_from_generated_pix, gt_sources],
+                sources=[None, sources_from_generated_pix, None],
                 # sources=[gt_sources*gen_im.shape[1]/512, sources_from_true, gt_sources],
                 save_fig=save_fig,
-                save_name=f"{save_folder}/sample_{partition}_{i}{additional_line}.png",
+                save_name=f"{save_folder}/sample_{self.partition}_{i}{self.additional_line}.png",
             )
             print("=============================================================================================")
         if len(sources_from_generated_all_runs) > 0:
@@ -809,9 +743,6 @@ class PredictedCatalog:
             sources_from_generated_all_runs = None
 
         data["predicted_sources"] = add_column_i(sources_from_generated_all_runs, i//self.runs_per_sample)
-        data["predicted_sources_from_true"] = add_column_i(sources_from_true, i//self.runs_per_sample)
-        data["gt_sources"] = add_column_i(gt_sources_astro, i//self.runs_per_sample)
-        data["reconstruction_metrics"] = add_column_i(reconstruction_metrics_generated_all_runs, i//self.runs_per_sample)
         return data
 
     def test(
@@ -836,13 +767,10 @@ class PredictedCatalog:
         for i in tqdm.tqdm(range(0, len(self.images), self.runs_per_sample)):  #
             data = self.run_test_experiment(
                 i,
-                nb_sources,
-                verbose,
-                visualization,
+                True,#verbose,
+                True,#visualization,
                 apply_itransform,
-                SNR_fixed,
                 plot_brightness,
-                SNR_normalized=SNR_normalized,
                 aggr=aggr
             )
 
@@ -854,23 +782,10 @@ class PredictedCatalog:
 
             if data["predicted_sources"] is not None and len(data["predicted_sources"]) > 0:
                 predicted_sources.append(data["predicted_sources"])
-            if data["predicted_sources_from_true"] is not None and len(data["predicted_sources_from_true"]) > 0:
-                predicted_sources_from_true.append(data["predicted_sources_from_true"])
-            if data["gt_sources"] is not None and len(data["gt_sources"]) > 0:
-                gt_sources.append(data["gt_sources"])
 
-            reconstruction_metrics.append(data["reconstruction_metrics"])
         if len(predicted_sources) > 0:
             predicted_sources = np.vstack(predicted_sources, )
-
-        predicted_sources_from_true = np.vstack(predicted_sources_from_true)
-        gt_sources = np.vstack(gt_sources)
-        reconstruction_metrics = np.vstack(reconstruction_metrics)
-
         data["predicted_sources"] = predicted_sources
-        data["predicted_sources_from_true"] = predicted_sources_from_true
-        data["gt_sources"] = gt_sources
-        data["reconstruction_metrics"] = reconstruction_metrics
 
         return data
 
@@ -1036,7 +951,7 @@ def compute_metrics(tp, fp, ):
             metrics = 0
     return metrics
 
-def main(folders, dataset_folder, runs_per_sample, image_size=512, eps=5e-5, partition="test"):
+def main(folders, dataset_folder, runs_per_sample, image_size=512, eps=5e-5, partition="test", consistent_ra_dec=False):
     for folder in folders:
         catalog = PredictedCatalog(folder, dataset_folder, runs_per_sample, image_size, eps, partition)
         reconstruction_columns = ["l2", "l1", "psnr", "ssim"]
@@ -1046,12 +961,6 @@ def main(folders, dataset_folder, runs_per_sample, image_size=512, eps=5e-5, par
 
             final_metrics = initialize_final_metrics(runs_per_sample)
             res = catalog.test(plot_brightness=True,verbose=False, aggr=current_key)
-
-            #reconstruction metrics
-            reconstruction_metrics = pd.DataFrame(res["reconstruction_metrics"], columns=reconstruction_columns+["diff_idx",]+["image_idx",])
-            reconstruction_metrics.to_csv(folder+f"/{current_key}_reconstruction_metrics.csv")
-
-            final_metrics[current_key]["reconstruction_metric"] = reconstruction_metrics[reconstruction_metrics["diff_idx"] == -1].to_dict()
 
             #predicted tables for sources
             predicted_sources = pd.DataFrame(res["predicted_sources"], columns=astropy_columns+["diff_idx",]+["image_idx",])
@@ -1067,28 +976,19 @@ def main(folders, dataset_folder, runs_per_sample, image_size=512, eps=5e-5, par
             predicted_sources.to_csv(folder+f"/{current_key}_predicted_sources.csv")
             predicted_sources[predicted_sources["diff_idx"]==-1].to_csv(folder + f"/{current_key}_predicted_sources.csv")
 
-            predicted_sources_from_true = pd.DataFrame(res["predicted_sources_from_true"], columns=astropy_columns+["image_idx",])
-            predicted_sources_from_true.to_csv(folder+"/predicted_sources_from_true.csv")
-
-            gt_sources = pd.DataFrame(res["gt_sources"], columns=casa_columns + ["image_idx", ])
-            gt_sources.to_csv(folder + "/gt_sources.csv")
-
-            filtered_predicted = predicted_sources[(predicted_sources["diff_idx"] == -1)]
-            final_metrics = update_dict(filtered_predicted, final_metrics, gt_sources, current_key)
-
-        for i in range(runs_per_sample):
-            final_metrics[f"individual_{i}"]["reconstruction_metric"] = reconstruction_metrics[reconstruction_metrics["diff_idx"] == i].to_dict()
-
-        for diff_idx in range(0, runs_per_sample, 1):
-            key= f"individual_{diff_idx}"
-            filtered_predicted = predicted_sources[(predicted_sources["diff_idx"] == diff_idx)]
-            final_metrics = update_dict(filtered_predicted, final_metrics, gt_sources, key)
 
         # Apply the function for each image_idx and concat the result
-        try:
-            clustered_data = pd.concat([cluster_points(predicted_sources, image_idx, eps) for image_idx in predicted_sources["image_idx"].unique()])
-        except ValueError:
-            return
+        if not consistent_ra_dec:
+            try:
+                clustered_data = pd.concat([cluster_points(predicted_sources, image_idx, eps) for image_idx in predicted_sources["image_idx"].unique()])
+            except ValueError:
+                return
+        else:
+            try:
+                clustered_data = cluster_points(predicted_sources, None, eps)
+            except ValueError:
+                return
+
 
         # Group by image_idx and cluster, and calculate mean and std for each group
         aggregated_data = clustered_data.groupby(["image_idx", "cluster"]).agg({
@@ -1125,24 +1025,27 @@ def main(folders, dataset_folder, runs_per_sample, image_size=512, eps=5e-5, par
         aggregated_sources.reset_index(inplace=True)
         aggregated_sources.to_csv(folder+"/aggregated_sources.csv")
 
-        for counts in range(1, runs_per_sample, 1):
-
-            key= f"localized_threshold_{counts}"
-            aggregated_sources_filtered = aggregated_sources[aggregated_sources["diff_idx_count"] > counts]
-            final_metrics = update_dict(aggregated_sources_filtered, final_metrics, gt_sources, key)
-
-        np.save(f"{folder}/final_metrics.npy", final_metrics)
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', '-c', type=str,
                         default='./configs/generator.yaml',
                         help='Path to config')
     parser.add_argument('--runs_per_sample',
-                        type=int, default=-1)
+                        type=int, default=-1,
+                        help='Runs per images passed for generating.')
+    parser.add_argument('--consistent_ra_dec',
+                        type=bool, default=False,
+                        help='If set to true, data assumes to be self consistent, \
+                        so each source is searched among all images.\
+                        The changes will be seen only for aggregated sources via detect-aggregate.')
     parser.add_argument('--folders', nargs='+', required=True, help='List of folders to process')
     args = parser.parse_args()
     config = get_config(args.config)
 
     folders = args.folders
-    main(folders, dataset_folder=config["dataset"]["image_path"], runs_per_sample=args.runs_per_sample)
+    main(
+        folders,
+        dataset_folder=config["dataset"]["image_path"],
+        runs_per_sample=args.runs_per_sample,
+        consistent_ra_dec=args.consistent_ra_dec
+    )

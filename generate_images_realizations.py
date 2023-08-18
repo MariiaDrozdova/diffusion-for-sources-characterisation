@@ -28,7 +28,7 @@ def main(args) -> None:
     output_path = Path(args.output+f"_power{config['dataset']['power']}")
     output_path.mkdir(exist_ok=True, parents=True)
 
-    module = GeneratorModule.load_from_checkpoint(checkpoint_path=path_checkpoint,
+    module = GeneratorModule.load_from_checkpoint(checkpoint_path=path_checkpoint, strict=False,
                                                   config=config, use_fp16=config['fp16'],
                                                   timestep_respacing=str(args.timestep_respacing))
     module.eval()

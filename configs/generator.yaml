@@ -18,7 +18,7 @@ model:
   diffusion_steps: 1000
 
 dataset:
-  image_path: toy_data/
+  image_path: example_data/mock_real_data/
   label_path:
   size: 128
   n_classes:

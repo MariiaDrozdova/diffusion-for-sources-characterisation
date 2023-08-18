@@ -48,7 +48,7 @@ class SkaDataset(Dataset):
         if os.path.exists(true_file):
             true = np.load(true_file)[np.newaxis, ...]
         else:
-            true = np.zeros(1, 512, 512)
+            true = np.zeros((1, 512, 512))
 
         # cutting the circle, the same one we have in dirty images from CASA
         #mask = np.load("dirty_mask.npy").reshape(-1, 512, 512)
@@ -72,7 +72,9 @@ class SkaDataset(Dataset):
 
         dirty_noisy = open_dirty_noisy(file_name)
 
-        dirty_noisy = dirty_noisy / 3.0e-5
+        dirty_noisy = dirty_noisy / 5e-4#3.0e-5
+
+        dirty_noisy = (dirty_noisy - 0.5) / 0.5
         dirty_noisy = torch.from_numpy(dirty_noisy).float()
 
         data["true"] = torch.nn.functional.interpolate(
