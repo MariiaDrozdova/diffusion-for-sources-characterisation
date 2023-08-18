@@ -7,6 +7,7 @@ import re
 import pickle
 import warnings
 
+import tqdm
 import torch
 import torchvision
 import numpy as np
@@ -37,6 +38,8 @@ from src.utils import get_config
 
 warnings.simplefilter('ignore', category=FITSFixedWarning)
 
+NOISE_PER_IMAGE = 5e-5 #in our experiment noise amplitude is constant
+
 astropy_columns = [
     "ra",  # /xcentroid",
     "dec",  # /ycentroid",
@@ -59,6 +62,66 @@ casa_columns = [
     "minor",
     "major",
 ]
+
+
+def initialize_snr_metrics():
+    return {
+        "snrs": None,
+        "purity": None,
+        "completeness": None,
+        "nb_points": None,
+        "tp": 0,
+        "fp": 0,
+        "fn": 0
+    }
+
+
+def initialize_of_nbs_metrics():
+    return {
+        "purity": None,
+        "completeness": None
+    }
+
+
+def initialize_final_metric_entry():
+    return {
+        "resonstruction_metrics": {},
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "purity": 0,
+        "completeness": 0,
+        "snr": initialize_snr_metrics(),
+        "snrnorm": initialize_snr_metrics(),  # Assuming snrnorm has the same structure as snr
+        "of_nbs": initialize_of_nbs_metrics(),
+        "values": None
+    }
+
+
+def initialize_final_metrics(runs_per_sample):
+    metrics = {
+        "mean": initialize_final_metric_entry(),
+        "medoid": initialize_final_metric_entry(),
+        "median": initialize_final_metric_entry(),
+    }
+
+    for i in range(runs_per_sample):
+        metrics[f"individual_{i}"] = initialize_final_metric_entry()
+        metrics[f"localized_threshold_{i}"] = initialize_final_metric_entry()
+
+    return metrics
+
+# Function to cluster points (ra, dec) within each image using DBSCAN
+def cluster_points(dataframe, image_idx, eps=5e-5):
+    # Filter data for specific image
+    image_data = dataframe[dataframe["image_idx"] == image_idx]
+
+    # Apply DBSCAN
+    clustering = DBSCAN(eps=eps, min_samples=2).fit(image_data[['ra', 'dec']])
+    image_data = image_data.copy()
+    image_data['cluster'] = clustering.labels_
+
+    return image_data
 
 def compute_psnr_ssim(image1, image2):
 
@@ -89,557 +152,673 @@ def prepareHeaders(header):
     header.remove("ORIGIN", remove_all=True)
     return header
 
+def image_to_sources(
+        image, verbose=False,
+        image_size=512,
+        detect_npixels=15
+):
+    if np.max(image) < 1e-10:
+        return None  # no sources
+    # Smooth the image with a Gaussian kernel to help with source detection
+    if image_size == 128:
+        sigma_clipped_stats_sigma = 3.0
+        detect_npixels = 5
+        deblend_sources_npixels = 1
+        std_const = 5
 
-def reorder_repeated(input_array, repeat):
-    im_shape = input_array.shape[1:]
-    N = input_array.shape[0]
+    if image_size == 512:
+        sigma_clipped_stats_sigma = 2  # 25.0#10.0
+        detect_npixels = 10  # detect_npixels
+        deblend_sources_npixels = 10
+        std_const = 120  # 12
 
-    # Compute the number of times each almost same image appears in the input array
-    num_repeats = N // repeat
+    # Calculate the threshold for source detection
+    mean, median, std = sigma_clipped_stats(image, sigma=sigma_clipped_stats_sigma)
+    threshold = (std_const * std)
 
-    # Reshape the input array to stack the almost same images one after another
-    reshaped_array = np.reshape(input_array, (repeat, num_repeats, *im_shape))
+    # Detect the sources in the image
+    segm = detect_sources(image, threshold, npixels=detect_npixels)
 
-    # Transpose the dimensions of the reshaped array to put the almost same images together
-    transpose_axes = [1, 0] + list(range(2, len(im_shape) + 2))
-    reshaped_array = np.transpose(reshaped_array, transpose_axes)
+    # Deblend the sources
+    try:
+        segm_deblend = deblend_sources(image, segm, npixels=deblend_sources_npixels,
+                                       progress_bar=None)  # , deblend_cont=0.01)
+    except ValueError:
+        return None
+    props = SourceCatalog(image, segm_deblend)
 
-    # Reshape the array back to its original shape
-    reordered_array = np.reshape(reshaped_array, (N, *im_shape))
+    coords = []
 
-    return reordered_array
+    # Print the properties of each detected source
+    for prop in props:
+        if verbose:
+            print('Xcentroid =', prop.xcentroid.value)
+            print('Ycentroid =', prop.ycentroid.value)
+            print('Source area =', prop.area.value)
+            print('Source integrated flux =', prop.source_sum)
+        coords.append([
+            prop.xcentroid,
+            prop.ycentroid,
+            prop.data.sum(),
+            prop.area.value,
+            prop.equivalent_radius.value,
+            0.1 * 2.3548 * prop.semiminor_sigma.value,
+            0.1 * 2.3548 * prop.semimajor_sigma.value,
+            prop.max_value,
+            prop.min_value,
+            (prop.eccentricity * u.m).value,
+            (prop.orientation * u.m).value,
+        ])
+    coords = np.array(coords)
+    return coords
 
 
+def true_trasnform(true, power):
+    const = (0.7063881) ** (30.0 / power)
+    true = (true) ** (1. / power)
+    true = (true) / const
+    true = (true - 0.5) / 0.5
+    return true
+
+
+def true_itrasnform(true, power):
+    const = (0.7063881) ** (30.0 / power)
+    true_back = true * const
+    true_back = (true_back) ** (power)
+    return true_back
+
+
+def actro_to_pix(true_sources, wcs):
+    true_sources = np.array(true_sources)
+    coords_deg = np.hstack((true_sources[:, 0:1], true_sources[:, 1:2], np.zeros((true_sources.shape[0], 2))))
+    coords_pix = wcs.wcs_world2pix(coords_deg, 0)
+    gt_sources = np.array(coords_pix)[:, :4]  # *128/512
+    gt_sources = gt_sources.astype(int).astype(float)
+    return gt_sources
+
+
+def pix_to_astro(pixel_coords, wcs):
+    if pixel_coords is None:
+        return pixel_coords
+    pixel_coords = np.array(pixel_coords)
+    coords_pix = np.hstack((pixel_coords[:, 0:1], pixel_coords[:, 1:2], np.zeros((pixel_coords.shape[0], 2))))
+    coords_deg = wcs.wcs_pix2world(coords_pix, 0)
+    celestial_coords = np.array(coords_deg)[:, :2]
+    pixel_coords[:, :2] = celestial_coords
+    astro_coords = pixel_coords
+    return astro_coords
+
+
+def im_reshape(downsampled_array):
+    if downsampled_array.shape[1] == 512:
+        return downsampled_array
+    im_size = downsampled_array.shape[1]
+    scale_factor = 512 // im_size
+    downsampled_image = torch.tensor(downsampled_array).reshape(1, 1, im_size, im_size, )
+    upsampled_image = torch.nn.functional.interpolate(downsampled_image, scale_factor=scale_factor, mode='bicubic')
+    upsampled_image = upsampled_image.data.numpy()[0, 0, :, :, ]
+    return upsampled_image
+
+
+def add_column_i(sources, i):
+    if sources is None:
+        return None
+    N = sources.shape[0]
+    column_to_add = i * np.ones((N, 1))
+    result = np.hstack((sources, column_to_add))
+    return result
+
+
+def compute_reconstruction_metrics_from_im(gen_im, im, verbose=False, power=None):
+    l2_dif = np.sqrt(np.sum(np.square(gen_im - im)))
+    l1_dif = np.sum(np.abs(gen_im - im))
+    image1 = true_trasnform(gen_im, power) / 2 + 0.5
+    #
+
+    image2 = true_trasnform(im, power) / 2 + 0.5
+    image1[image1 > 1] = 1
+    image2[image2 > 1] = 1
+    image1[image1 < 0] = 0
+    image2[image2 < 0] = 0
+
+    # image2 = image2*np.max(image1)/np.max(image2)
+
+    if verbose:
+        plt.imshow(image1)
+        plt.show()
+        plt.imshow(image2)
+        plt.show()
+
+    psnr, ssim = compute_psnr_ssim(image1, image2)
+
+    if verbose:
+        print(ssim, psnr)
+    reconstruction_metrics = [
+        l2_dif,
+        l1_dif,
+        psnr,
+        ssim,
+    ]
+    return reconstruction_metrics
+
+
+def compute_localization(current, filtering_for_fp=None, verbose=False):
+    # Count the number of NaNs in each column where sources detected - false positive
+    if filtering_for_fp is None:
+        fp = current[["flux"]].isna().any(axis=1).sum()
+    else:
+        fp = current[["flux"]][filtering_for_fp].isna().any(axis=1).sum()
+
+    # Count the number of NaNs in column diff_idx in results - false negative
+    fn = current[["area_predicted"]].isna().any(axis=1).sum()
+    tp = current[["flux", "area_predicted"]].notna().all(axis=1).sum()
+    if verbose:
+        print(fp, tp, fn)
+        print("purity=", tp / (tp + fp))
+        print("completeness=", tp / (tp + fn))
+    return tp, fp, fn
+
+
+def merge_pd_frames(gt_sources_, predicted_sources_, verbose=False):
+    # Threshold for distance
+    eps = 5e-5
+
+    predicted_sources = predicted_sources_.copy()
+    predicted_sources['index'] = predicted_sources.index
+
+    gt_sources = gt_sources_.copy()
+    gt_sources['index'] = gt_sources.index
+
+    # Dataframe to store the result
+    columns = list(gt_sources.columns) + [col + '_predicted' for col in predicted_sources.columns]
+    result = pd.DataFrame(columns=columns)
+
+    # Loop through each unique image_idx in gt_sources
+    for image_idx in set(gt_sources['image_idx']):
+        # Filter data for the current image_idx
+        gt_filtered = gt_sources[gt_sources['image_idx'] == image_idx].reset_index(drop=True)
+        pred_filtered = predicted_sources[predicted_sources['image_idx'] == image_idx].reset_index(drop=True)
+        if verbose:
+            print(image_idx)
+            display(gt_filtered)
+            display(pred_filtered)
+
+        # Check if either gt_filtered or pred_filtered is empty
+        if len(gt_filtered) == 0 or len(pred_filtered) == 0:
+            # Append rows from gt_filtered or pred_filtered with no match
+            for i in range(len(gt_filtered)):
+                row = pd.concat([gt_filtered.iloc[i], pd.Series([np.nan] * len(predicted_sources.columns),
+                                                                index=[col + '_predicted' for col in
+                                                                       predicted_sources.columns])])
+                result = pd.concat([result, pd.DataFrame([row])], ignore_index=True)
+            for j in range(len(pred_filtered)):
+                row = pd.concat([pd.Series([np.nan] * len(gt_sources.columns), index=gt_sources.columns),
+                                 pred_filtered.iloc[j].add_suffix('_predicted')])
+                result = pd.concat([result, pd.DataFrame([row])], ignore_index=True)
+        else:
+            # Compute squared differences for ra and dec
+            ra_diff = (gt_filtered['ra'].values[:, np.newaxis] - pred_filtered['ra'].values) ** 2
+            dec_diff = (gt_filtered['dec'].values[:, np.newaxis] - pred_filtered['dec'].values) ** 2
+
+            # Compute squared distances
+            squared_distances = ra_diff + dec_diff
+
+            # Find the closest neighbor for each point in gt_filtered
+            closest_indices = np.argmin(squared_distances, axis=1)
+            closest_distances = squared_distances[np.arange(len(gt_filtered)), closest_indices]
+
+            # Match points in gt_filtered to their closest neighbors in pred_filtered
+            for i in range(len(gt_filtered)):
+                # Check if the closest neighbor is within the threshold
+                if closest_distances[i] < eps ** 2:
+                    # Join the matched rows
+                    row = pd.concat(
+                        [gt_filtered.iloc[i], pred_filtered.iloc[closest_indices[i]].add_suffix('_predicted')])
+                else:
+                    # Join with NaN for missing values from predicted_sources
+                    row = pd.concat([gt_filtered.iloc[i], pd.Series([np.nan] * len(predicted_sources.columns),
+                                                                    index=[col + '_predicted' for col in
+                                                                           predicted_sources.columns])])
+
+                # Append the row to the result dataframe
+                result = pd.concat([result, pd.DataFrame([row])], ignore_index=True)
+
+            # Mark the matched rows in pred_filtered as used
+            pred_filtered_used = pred_filtered.iloc[closest_indices]
+            pred_filtered_unused = pred_filtered[~pred_filtered.index.isin(pred_filtered_used.index)]
+            if verbose:
+                print("matched")
+                display(pred_filtered_used)
+                print("unmatched")
+                display(pred_filtered_unused)
+
+            # Append unused rows from pred_filtered with no match in gt_filtered
+            if len(pred_filtered_unused) > 0:
+                for _, row in pred_filtered_unused.iterrows():
+                    row = pd.concat([pd.Series([np.nan] * len(gt_sources.columns), index=gt_sources.columns),
+                                     row.add_suffix('_predicted')])
+                    result = pd.concat([result, pd.DataFrame([row])], ignore_index=True)
+
+    # Append remaining rows from predicted_sources with no match in gt_sources
+    indexes = predicted_sources.index.isin(result.index_predicted)
+    unmatched_predicted = predicted_sources[~indexes]
+    indexes = indexes + 0
+
+    unmatched_nb = len(unmatched_predicted)
+
+    if len(unmatched_predicted) > 0:
+        for _, row in unmatched_predicted.iterrows():
+            row = pd.concat(
+                [pd.Series([np.nan] * len(gt_sources.columns), index=gt_sources.columns), row.add_suffix('_predicted')])
+            result = pd.concat([result, pd.DataFrame([row])], ignore_index=True)
+    else:
+        pass
+
+    return result, unmatched_nb
+
+
+def plot_generated_images(
+        true,
+        generated,
+        artificial_dirty_im,
+        uncertainty=None,
+        sources=(None, None, None),
+        save_fig=False,
+        save_name=None,
+):
+    clean_sources, generated_sources, true_sources = sources
+    if uncertainty is not None and np.sum(uncertainty) == 0:
+        if np.sum(true - generated) == 0:
+            fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(14, 4))
+            # fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(10,4))
+        else:
+            fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(14, 4))
+    elif np.sum(true - generated) != 0:
+        fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(18, 4))
+    else:
+        fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(18, 4))
+
+    axes[0].set_title("noisy dirty image")
+    im0 = axes[0].imshow(artificial_dirty_im)
+    if true_sources is not None:
+        true_sources = true_sources[(true_sources[:, 0] >= 0) & (true_sources[:, 0] <= 512) &
+                                    (true_sources[:, 1] >= 0) & (true_sources[:, 1] <= 512)]
+        axes[0].scatter(true_sources[:, 0], true_sources[:, 1], s=90, c='none', marker="o", edgecolor='r', linewidths=1)
+    axes[0].set_xticks([])
+    axes[0].set_yticks([])
+    cbar = plt.colorbar(im0, ax=axes[0])
+    # Set the colorbar tick format
+    cbar.formatter = ticker.ScalarFormatter(useMathText=True)
+    cbar.formatter.set_powerlimits((-4, 4))
+    cbar.ax.yaxis.set_offset_position('left')
+    cbar.update_ticks()
+
+    axes[1].set_title("true image")
+    im1 = axes[1].imshow(true)
+    if clean_sources is not None:
+        axes[1].scatter(clean_sources[:, 0], clean_sources[:, 1], s=90, c='none', marker="o", edgecolor='r',
+                        linewidths=1)
+    axes[1].set_xticks([])
+    axes[1].set_yticks([])
+    cbar = plt.colorbar(im1, ax=axes[1])
+    # Set the colorbar tick format
+    cbar.formatter = ticker.ScalarFormatter(useMathText=True)
+    cbar.formatter.set_powerlimits((-4, 4))
+    cbar.ax.yaxis.set_offset_position('left')
+    cbar.update_ticks()
+
+    if np.sum(true - generated) != 0 or True:
+        axes[2].set_title("predicted image")
+        im2 = axes[2].imshow(generated)
+        if generated_sources is not None:
+            axes[2].scatter(generated_sources[:, 0], generated_sources[:, 1], s=90, c='none', marker="o", edgecolor='r',
+                            linewidths=1)
+        axes[2].set_xticks([])
+        axes[2].set_yticks([])
+        cbar = plt.colorbar(im2, ax=axes[2])
+        # Set the colorbar tick format
+        cbar.formatter = ticker.ScalarFormatter(useMathText=True)
+        cbar.formatter.set_powerlimits((-4, 4))
+        cbar.ax.yaxis.set_offset_position('left')
+        cbar.update_ticks()
+
+    if uncertainty is not None and np.sum(uncertainty) == 0:
+        pass
+    else:
+        if uncertainty is None:
+            axes[3].set_title("Difference")
+            im3 = axes[3].imshow(true - generated, cmap="plasma")
+        else:
+            axes[3].set_title("uncertainty")
+            im3 = axes[3].imshow(uncertainty, cmap="plasma")
+
+        cbar = plt.colorbar(im3, ax=axes[3])
+        # Set the colorbar tick format
+        cbar.formatter = ticker.ScalarFormatter(useMathText=True)
+        cbar.formatter.set_powerlimits((-6, 6))
+        cbar.ax.yaxis.set_offset_position('left')
+        cbar.update_ticks()
+        axes[3].set_xticks([])
+        axes[3].set_yticks([])
+
+    plt.suptitle(f"Results")
+    if save_fig:
+        plt.savefig(save_name)
+    else:
+        plt.show()
 def round_custom(x):
     return np.round(x * 2) / 2
 
 ROUND_SNR = 0
 
-def main(folders, dataset_folder, runs_per_sample, image_size = 512):
-    image_size = image_size
-    for folder in folders:
-        partition="test"
-        batch_numbers = compute_batch_nbs(folder)
 
-        if runs_per_sample != -1:
-            test_generated_images = []
-            test_images = []
-            sky_indexes = []
-            noisy_input = []
+class PredictedCatalog:
+    def __init__(
+            self,
+            folder,
+            dataset_folder,
+            runs_per_sample,
+            image_size=512,
+            eps=5e-5,
+            partition="test"
+    ):
+        self.folder = folder
+        self.dataset_folder = dataset_folder
+        self.runs_per_sample = runs_per_sample
+        self.image_size = image_size
+        self.eps = eps
+        self.partition = partition
+        self.power = self._extract_power_from_folder_name()
 
+        self.generated_images = []
+        self.images = []
+        self.sky_indexes = []
+        self.noisy_input = []
+        self.sky_keys = []
+        self.phase_dict = {}
+        self.snr_extended = {}
+        self.load_data()
+
+    def _extract_power_from_folder_name(self):
+        # Search for a pattern 'power' followed by one or more digits possibly with a decimal point
+        match = re.search(r'power(\d+(\.\d+)?)', self.folder)
+        # If a match is found, extract the power value, otherwise set to default (30)
+        return float(match.group(1)) if match else 30
+
+    def _compute_batch_nbs(self):
+        file_prefix = "batch="
+        file_suffix = "_test_dirty_noisy.npy"
+        all_files = [f for f in os.listdir(self.folder) if f.startswith(file_prefix) and f.endswith(file_suffix)]
+        # Extract batch numbers
+        batch_numbers = [int(f[len(file_prefix):-len(file_suffix)]) for f in all_files]
+        batch_numbers.sort()
+        return batch_numbers
+
+    def reorder_repeated(self, input_array,):
+        im_shape = input_array.shape[1:]
+        N = input_array.shape[0]
+
+        # Compute the number of times each almost same image appears in the input array
+        num_repeats = N // self.runs_per_sample
+
+        # Reshape the input array to stack the almost same images one after another
+        reshaped_array = np.reshape(input_array, (self.runs_per_sample, num_repeats, *im_shape))
+
+        # Transpose the dimensions of the reshaped array to put the almost same images together
+        transpose_axes = [1, 0] + list(range(2, len(im_shape) + 2))
+        reshaped_array = np.transpose(reshaped_array, transpose_axes)
+
+        # Reshape the array back to its original shape
+        reordered_array = np.reshape(reshaped_array, (N, *im_shape))
+
+        return reordered_array
+    def load_data(self):
+        if self.runs_per_sample != -1:
+            batch_numbers = self._compute_batch_nbs()
             for i in batch_numbers:
                 line=f"batch={i}_"
-                test_generated_images_i = np.load(f"{folder}/{line}{partition}_generated_images.npy")
-                test_images_i = np.load(f"{folder}/{line}{partition}_images.npy")
-                sky_indexes_i = np.load(f"{folder}/{line}{partition}_sky_indexes.npy")
-                noisy_input_i = np.load(f"{folder}/{line}{partition}_dirty_noisy.npy")
+                test_generated_images_i = np.load(f"{self.folder}/{line}{self.partition}_generated_images.npy")
+                test_images_i = np.load(f"{self.folder}/{line}{self.partition}_images.npy")
+                sky_indexes_i = np.load(f"{self.folder}/{line}{self.partition}_sky_indexes.npy")
+                noisy_input_i = np.load(f"{self.folder}/{line}{self.partition}_dirty_noisy.npy")
 
-                test_generated_images_i = reorder_repeated(test_generated_images_i, runs_per_sample)
-                test_images_i = reorder_repeated(test_images_i, runs_per_sample)
-                sky_indexes_i = reorder_repeated(sky_indexes_i, runs_per_sample)
-                noisy_input_i = reorder_repeated(noisy_input_i, runs_per_sample)
+                test_generated_images_i = self.reorder_repeated(test_generated_images_i,)
+                test_images_i = self.reorder_repeated(test_images_i,)
+                sky_indexes_i = self.reorder_repeated(sky_indexes_i,)
+                noisy_input_i = self.reorder_repeated(noisy_input_i,)
 
-                test_generated_images.append(test_generated_images_i)
-                test_images.append(test_images_i)
-                sky_indexes.append(sky_indexes_i)
-                noisy_input.append(noisy_input_i)
+                self.generated_images.append(test_generated_images_i)
+                self.images.append(test_images_i)
+                self.sky_indexes.append(sky_indexes_i)
+                self.noisy_input.append(noisy_input_i)
 
-            test_generated_images = np.concatenate(test_generated_images)
-            test_images = np.concatenate(test_images)
-            sky_indexes = np.concatenate(sky_indexes)
-            noisy_input = np.concatenate(noisy_input)
+            self.generated_images = np.concatenate(self.generated_images)
+            self.images = np.concatenate(self.images)
+            self.sky_indexes = np.concatenate(self.sky_indexes)
+            self.noisy_input = np.concatenate(self.noisy_input)
 
         else:
-            test_generated_images = np.load(f"{folder}/{partition}_generated_images.npy")
-            test_images = np.load(f"{folder}/{partition}_images.npy")
-            sky_indexes = np.load(f"{folder}/{partition}_gt_sources.npy")
-            noisy_input = np.load(f"{folder}/{partition}_dirty_noisy.npy")
+            self.generated_images = np.load(f"{folder}/{partition}_generated_images.npy")
+            self.images = np.load(f"{folder}/{partition}_images.npy")
+            self.sky_indexes = np.load(f"{folder}/{partition}_gt_sources.npy")
+            self.noisy_input = np.load(f"{folder}/{partition}_dirty_noisy.npy")
 
-        sky_keys = np.load(f"{dataset_folder}/sky_keys.npy")
-        phase_dict = np.load(f"{dataset_folder}/ra_dec.npy", allow_pickle=True).item()
+        self.sky_keys = np.load(f"{self.dataset_folder}/sky_keys.npy")
+        self.phase_dict = np.load(f"{self.dataset_folder}/ra_dec.npy", allow_pickle=True).item()
 
-        noisy_folder = f"{dataset_folder}/dirty"
-        noisy_im_filenames = os.listdir(noisy_folder)
-        noisy_im_filenames.sort()
+        self.noisy_folder = f"{self.dataset_folder}/dirty"
+        self.true_folder = f"{self.dataset_folder}/true"
+
+        self.noisy_im_filenames = os.listdir(self.noisy_folder)
+        self.noisy_im_filenames.sort()
 
         # ra, dec, SNR, SNR normalized, flux, major, minor
-        snr_extended = np.load(f"{dataset_folder}/sky_sources_snr_extended.npy", allow_pickle=True)
-        snr_extended = snr_extended.item()
+        self.snr_extended = np.load(f"{self.dataset_folder}/sky_sources_snr_extended.npy", allow_pickle=True).item()
+        self.additional_line=""
 
-        true_folder = f"{dataset_folder}/true"
+        self.generated_images = self.images
 
-        additional_line=""
-        test_generated_images = test_images
+    def load_header(self, key):
+        # our basic train val and test sets. All headers are saved separately as pickle objects
+        # in the separate folder "headers"
+        # Create a new header instance
+        values = self.phase_dict.get(key)
+        header = fits.Header()
 
-        # Search for a pattern 'power' followed by one or more digits possibly with a decimal point
-        match = re.search(r'power(\d+(\.\d+)?)', folder)
-        # If a match is found, extract the power value, otherwise set to default (30)
-        power = float(match.group(1)) if match else 30
+        header['NAXIS'] = 4
+        header['CTYPE1'] = 'RA---SIN'
+        header['CRPIX1'] = self.image_size / 2
+        header['CRVAL1'] = values["RA"]
+        header['CUNIT1'] = 'deg'
+        header['CDELT1'] = -2.777777777778E-05
+        header['CTYPE2'] = 'DEC--SIN'
+        header['CRPIX2'] = self.image_size / 2
+        header['CRVAL2'] = values["DEC"]
+        header['CUNIT2'] = 'deg'
+        header['CDELT2'] = 2.777777777778E-05
+        return header
 
-        def true_trasnform(true):
-            const = (0.7063881)**(30.0/power)
-            true = (true)**(1./power)
-            true = (true)/const
-            true = (true - 0.5)/0.5
-            return true
+    def load_wcs(self, key):
+        header = self.load_header(key)
+        wcs = WCS(header)
+        return wcs
 
-        def true_itrasnform(true):
-            const = (0.7063881)**(30.0/power)
-            true_back= true*const
-            true_back = (true_back)**(power)
-            return true_back
-
-        def image_to_sources(
-            image, verbose=False,
-            image_size=512,
-            detect_npixels=15
-        ):
-            if np.max(image) < 1e-10:
-                return None #no sources
-            # Smooth the image with a Gaussian kernel to help with source detection
-            if image_size == 128:
-                sigma_clipped_stats_sigma = 3.0
-                detect_npixels = 5
-                deblend_sources_npixels = 1
-                std_const = 5
-
-            if image_size == 512:
-                sigma_clipped_stats_sigma = 2#25.0#10.0
-                detect_npixels = 10#detect_npixels
-                deblend_sources_npixels = 10
-                std_const = 120#12
-
-            # Calculate the threshold for source detection
-            mean, median, std = sigma_clipped_stats(image, sigma=sigma_clipped_stats_sigma)
-            threshold =  (std_const* std)
-
-            # Detect the sources in the image
-            segm = detect_sources(image, threshold, npixels=detect_npixels)
-
-            # Deblend the sources
-            try:
-                segm_deblend = deblend_sources(image, segm, npixels=deblend_sources_npixels, progress_bar=None)#, deblend_cont=0.01)
-            except ValueError:
-                return None
-            props = SourceCatalog(image, segm_deblend)
-
-            coords = []
-
-            # Print the properties of each detected source
-            for prop in props:
-                if verbose:
-                    print('Xcentroid =', prop.xcentroid.value)
-                    print('Ycentroid =', prop.ycentroid.value)
-                    print('Source area =', prop.area.value)
-                    print('Source integrated flux =', prop.source_sum)
-                coords.append([
-                    prop.xcentroid,
-                    prop.ycentroid,
-                    prop.data.sum(),
-                    prop.area.value,
-                    prop.equivalent_radius.value,
-                    0.1* 2.3548*prop.semiminor_sigma.value,
-                    0.1* 2.3548*prop.semimajor_sigma.value,
-                    prop.max_value,
-                    prop.min_value,
-                    (prop.eccentricity*u.m).value,
-                    (prop.orientation*u.m).value,
-                ])
-            coords = np.array(coords)
-            return coords
-
-        def plot_generated_images(
-            true,
-            generated,
-            artificial_dirty_im,
-            uncertainty=None,
-            sources=(None, None, None),
-            save_fig=False,
-            save_name=None,
-        ):
-
-
-            clean_sources, generated_sources, true_sources = sources
-            if uncertainty is not None and np.sum(uncertainty) == 0:
-                if np.sum(true-generated) == 0:
-                    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(14,4))
-                    #fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(10,4))
-                else:
-                    fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(14,4))
-            elif np.sum(true-generated) != 0:
-                fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(18,4))
-            else:
-                fig, axes = plt.subplots(nrows=1, ncols=4, figsize=(18,4))
-
-            axes[0].set_title("noisy dirty image")
-            im0 = axes[0].imshow(artificial_dirty_im)
-            if true_sources is not None:
-
-                true_sources = true_sources[(true_sources[:, 0] >= 0) & (true_sources[:, 0] <= 512) &
-                                    (true_sources[:, 1] >= 0) & (true_sources[:, 1] <= 512)]
-                axes[0].scatter(true_sources[:,0], true_sources[:,1], s=90, c='none', marker="o", edgecolor='r', linewidths=1)
-            axes[0].set_xticks([])
-            axes[0].set_yticks([])
-            cbar = plt.colorbar(im0, ax=axes[0])
-            # Set the colorbar tick format
-            cbar.formatter = ticker.ScalarFormatter(useMathText=True)
-            cbar.formatter.set_powerlimits((-4, 4))
-            cbar.ax.yaxis.set_offset_position('left')
-            cbar.update_ticks()
-
-            axes[1].set_title("true image")
-            im1 = axes[1].imshow(true)
-            if clean_sources is not None:
-                axes[1].scatter(clean_sources[:,0], clean_sources[:,1], s=90,c='none', marker="o", edgecolor='r', linewidths=1)
-            axes[1].set_xticks([])
-            axes[1].set_yticks([])
-            cbar = plt.colorbar(im1, ax=axes[1])
-            # Set the colorbar tick format
-            cbar.formatter = ticker.ScalarFormatter(useMathText=True)
-            cbar.formatter.set_powerlimits((-4, 4))
-            cbar.ax.yaxis.set_offset_position('left')
-            cbar.update_ticks()
-
-            if np.sum(true-generated) != 0 or True:
-                axes[2].set_title("predicted image")
-                im2 = axes[2].imshow(generated)
-                if generated_sources is not None:
-                    axes[2].scatter(generated_sources[:,0], generated_sources[:,1], s=90,c='none', marker="o", edgecolor='r', linewidths=1)
-                axes[2].set_xticks([])
-                axes[2].set_yticks([])
-                cbar = plt.colorbar(im2, ax=axes[2])
-                # Set the colorbar tick format
-                cbar.formatter = ticker.ScalarFormatter(useMathText=True)
-                cbar.formatter.set_powerlimits((-4, 4))
-                cbar.ax.yaxis.set_offset_position('left')
-                cbar.update_ticks()
-
-            if uncertainty is not None and np.sum(uncertainty) == 0:
-                pass
-            else:
-                if uncertainty is None:
-                    axes[3].set_title("Difference")
-                    im3 = axes[3].imshow(true - generated, cmap="plasma")
-                else:
-                    axes[3].set_title("uncertainty")
-                    im3 = axes[3].imshow(uncertainty, cmap="plasma")
-
-                cbar = plt.colorbar(im3, ax=axes[3])
-                # Set the colorbar tick format
-                cbar.formatter = ticker.ScalarFormatter(useMathText=True)
-                cbar.formatter.set_powerlimits((-6, 6))
-                cbar.ax.yaxis.set_offset_position('left')
-                cbar.update_ticks()
-                axes[3].set_xticks([])
-                axes[3].set_yticks([])
-
-            plt.suptitle(f"Results")
-            if save_fig:
-                plt.savefig(save_name)
-            else:
-                plt.show()
-
-
-        # In[13]:
-
-
-        from scipy.ndimage import zoom
-        from skimage.transform import resize
-        from scipy.spatial.distance import cdist
-        import tqdm
-
-        def load_header(key="0a1a6090-3e23-4708-bde7-fd875f57f6c1"):
-            # our basic train val and test sets. All headers are saved separately as pickle objects
-            # in the separate folder "headers"
-            if folder.find("real_data") != -1:
-                read_header = headers[key]
-                header = fits.Header()
-
-                header['NAXIS'] = 4
-                for key in read_header:
-                    header[key] = read_header[key]
-
-                return header
-            else:
-                # Create a new header instance
-                values = phase_dict.get(key)
-
-                header = fits.Header()
-
-                header['NAXIS'] = 4
-                header['CTYPE1'] = 'RA---SIN'
-                header['CRPIX1'] = image_size / 2
-                header['CRVAL1'] = values["RA"]
-                header['CUNIT1'] = 'deg'
-                header['CDELT1'] = -2.777777777778E-05
-                header['CTYPE2'] = 'DEC--SIN'
-                header['CRPIX2'] = image_size / 2
-                header['CRVAL2'] = values["DEC"]
-                header['CUNIT2'] = 'deg'
-                header['CDELT2'] = 2.777777777778E-05
-
-            return header
-
-        def load_wcs(key):
-            header = load_header(key)
-            wcs = WCS(header)
-            return wcs
-
-        def actro_to_pix(true_sources, wcs):
-            true_sources = np.array(true_sources)
-            coords_deg = np.hstack((true_sources[:,0:1], true_sources[:,1:2], np.zeros((true_sources.shape[0], 2))))
-            coords_pix = wcs.wcs_world2pix(coords_deg, 0)
-            gt_sources = np.array(coords_pix)[:,:4]#*128/512
-            gt_sources = gt_sources.astype(int).astype(float)
-            return gt_sources
-
-        def pix_to_astro(pixel_coords, wcs):
-            if pixel_coords is None:
-                return pixel_coords
-            pixel_coords = np.array(pixel_coords)
-            coords_pix = np.hstack((pixel_coords[:,0:1], pixel_coords[:,1:2], np.zeros((pixel_coords.shape[0], 2))))
-            coords_deg = wcs.wcs_pix2world(coords_pix, 0)
-            celestial_coords = np.array(coords_deg)[:,:2]
-            pixel_coords[:,:2] = celestial_coords
-            astro_coords = pixel_coords
-            return astro_coords
-
-        def im_reshape(downsampled_array):
-            if downsampled_array.shape[1] == 512:
-                return downsampled_array
-            im_size = downsampled_array.shape[1]
-            scale_factor = 512//im_size
-            downsampled_image = torch.tensor(downsampled_array).reshape(1,1,im_size,im_size,)
-            upsampled_image = torch.nn.functional.interpolate(downsampled_image, scale_factor=scale_factor, mode='bicubic')
-            upsampled_image = upsampled_image.data.numpy()[0,0,:,:,]
-            return upsampled_image
-
-        def add_column_i(sources, i):
-            if sources is None:
-                return None
-            N = sources.shape[0]
-            column_to_add = i*np.ones((N, 1))
-            result = np.hstack((sources, column_to_add))
-            return result
-
-        reconstruction_columns = ["l2", "l1", "psnr", "ssim"]
-
-        def compute_reconstruction_metrics_from_im(gen_im, im, verbose=False):
-            l2_dif = np.sqrt(np.sum(np.square(gen_im - im)))
-            l1_dif = np.sum(np.abs(gen_im - im))
-            image1 = true_trasnform(gen_im)/2+0.5
-            #
-
-            image2 = true_trasnform(im)/2+0.5
-            image1[image1>1] = 1
-            image2[image2>1] = 1
-            image1[image1<0] = 0
-            image2[image2<0] = 0
-
-            #image2 = image2*np.max(image1)/np.max(image2)
-
-            if verbose:
-                plt.imshow(image1)
-                plt.show()
-                plt.imshow(image2)
-                plt.show()
-
-            psnr, ssim = compute_psnr_ssim(image1, image2)
-
-            if verbose:
-
-
-                print(ssim, psnr)
-            reconstruction_metrics = [
-                    l2_dif,
-                    l1_dif,
-                    psnr,
-                    ssim,
-            ]
-            return reconstruction_metrics
-
-        def run_test_experiment(
+    def run_test_experiment(
+            self,
             i,
             nb_sources=None,
-            repeat_images=runs_per_sample,
             verbose=False,
             visualization=False,
             apply_itransform=True,
             SNR_fixed=None,
-            save_folder=folder,
             save_fig=False,
             SNR_normalized=False,
-            aggr="median"
-        ):
-                # corresponding index from fits name
-                sky_index = sky_indexes[i]
-                noisy_im = im_reshape(noisy_input[i])#np.load(noisy_folder + "/" + noisy_im_filenames[sky_index])
-                im = np.load(true_folder + "/" + noisy_im_filenames[sky_index])
-                im = np.nan_to_num(im)
-                key = sky_keys[sky_index]
-                true_sources = np.array(snr_extended[key])
+            aggr="median",
+    ):
+        # corresponding index from fits name
+        sky_index = self.sky_indexes[i]
+        key = self.sky_keys[sky_index]
+        true_sources = np.array(self.snr_extended[key])
+        im = np.load(self.true_folder + "/" + self.noisy_im_filenames[sky_index])
+        im = np.nan_to_num(im)
+        noisy_im = im_reshape(self.noisy_input[i])  # np.load(noisy_folder + "/" + noisy_im_filenames[sky_index])
+        repeat_images = self.runs_per_sample
+        save_folder = self.folder
 
-                # default value if no sources are found
-                data = {}
-                data["predicted_sources"] = []
-                data["predicted_sources_from_true"] = []
-                data["gt_sources"] = []
+        # default values if no sources are found
+        data = {}
+        data["predicted_sources"] = []
+        data["predicted_sources_from_true"] = []
+        data["gt_sources"] = []
 
-                if nb_sources is not None:
-                    if len(true_sources) != nb_sources:
-                        data["fn"] = 0
-                        # in this case it should not contribute to fn as the whole image is excluded
-                        return data
-                if SNR_fixed is not None and not SNR_normalized:
-                    if all(np.around(round_custom(true_sources[:,2].reshape(-1,1)), decimals=ROUND_SNR) != SNR_fixed):
-                        data["fn"] = 0
-                        # in this case it should not contribute to fn as the whole image is excluded
+        if nb_sources is not None:
+            if len(true_sources) != nb_sources:
+                data["fn"] = 0
+                # in this case it should not contribute to fn as the whole image is excluded
+                return data
+        if SNR_fixed is not None and not SNR_normalized:
+            if all(np.around(round_custom(true_sources[:, 2].reshape(-1, 1)), decimals=ROUND_SNR) != SNR_fixed):
+                data["fn"] = 0
+                # in this case it should not contribute to fn as the whole image is excluded
 
-                        return data
-
-                if SNR_fixed is not None and SNR_normalized:
-                    if all(np.around(round_custom(true_sources[:,3].reshape(-1,1)), decimals=ROUND_SNR) != SNR_fixed):
-                        data["fn"] = 0
-                        # in this case it should not contribute to fn as the whole image is excluded
-                        #print(np.around(true_sources[:,3].reshape(-1,1), decimals=ROUND_SNR))
-                        return data
-
-                if verbose or visualization:
-                    print("============================================FINAL============================================")
-                    print(i)
-
-
-
-                #get pixel true coordinates
-                if folder.find("real_data") != -1 and folder.find("pwv") != -1:
-                    wcs = load_wcs(key)
-                else:
-                    wcs = load_wcs(key)
-
-                gt_sources = actro_to_pix(true_sources, wcs)
-
-                gt_sources_astro = np.hstack(
-                    (
-                        true_sources[:,:2],
-                        true_sources[:,4].reshape(-1,1), #flux
-                        true_sources[:,2].reshape(-1,1), #SNR
-                        true_sources[:,3].reshape(-1,1), #SNR normalized
-                        0.5*(true_sources[:,5].reshape(-1,1)+true_sources[:,6].reshape(-1,1)), #major
-                        true_sources[:,6].reshape(-1,1), #nimor
-                    )
-                )
-
-                true_sources = true_sources[(gt_sources[:, 0] >= 0) & (gt_sources[:, 0] <= 512) &
-                                    (gt_sources[:, 1] >= 0) & (gt_sources[:, 1] <= 512)]
-                gt_sources_astro = gt_sources_astro[(gt_sources[:, 0] >= 0) & (gt_sources[:, 0] <= 512) &
-                                    (gt_sources[:, 1] >= 0) & (gt_sources[:, 1] <= 512)]
-
-                gen_ims = []
-                sources_from_generated_all_runs = []
-                reconstruction_metrics_generated_all_runs = []
-
-                for j in range(repeat_images):
-                    gen_im = test_generated_images[i+j]
-                    gen_im = gen_im[:,:,0]
-                    gen_im = im_reshape(gen_im)
-                    if np.max(true_itrasnform(gen_im)) < 1e-10:
-                        continue
-
-                    #per image detection cycle
-
-                    if apply_itransform:
-                        gen_im_astro = true_itrasnform(gen_im)
-
-                    sources_from_generated = image_to_sources(gen_im_astro)
-                    sources_from_generated = pix_to_astro(sources_from_generated, wcs)
-                    #adding column for j th run of diffusion model
-                    sources_from_generated = add_column_i(sources_from_generated, j)
-
-                    if sources_from_generated is not None:
-                        sources_from_generated_all_runs.append(sources_from_generated)
-
-                    reconstruction_metrics_generated = compute_reconstruction_metrics_from_im(gen_im_astro, im)
-                    reconstruction_metrics_generated = reconstruction_metrics_generated + [j,]
-                    reconstruction_metrics_generated_all_runs.append(reconstruction_metrics_generated)
-
-                    gen_ims.append(gen_im)
-                if len(gen_ims) == 0:
-                    gen_ims = [gen_im,]
-
-
-                ims_array = np.array(gen_ims)  # convert list to numpy array
-                gen_im = aggregate_images(ims_array, aggregation=aggr)
-                uncertainty=np.std(ims_array, axis=0)#/np.mean(ims_array, axis=0)
-
-                if apply_itransform:
-                    gen_im_astro = true_itrasnform(gen_im)
-
-                sources_from_true_pix = image_to_sources(im)
-                sources_from_true = pix_to_astro(sources_from_true_pix, wcs)
-
-                sources_from_generated_pix = image_to_sources(gen_im_astro)
-                sources_from_generated = pix_to_astro(sources_from_generated_pix, wcs)
-
-
-                # -1 to flag that it is aggregated
-                sources_from_generated = add_column_i(sources_from_generated, -1)
-
-                if sources_from_generated is not None:
-                    sources_from_generated_all_runs.append(sources_from_generated)
-
-                reconstruction_metrics_generated = compute_reconstruction_metrics_from_im(gen_im_astro, im, verbose=False)
-                reconstruction_metrics_generated = reconstruction_metrics_generated + [-1,]
-                reconstruction_metrics_generated_all_runs.append(reconstruction_metrics_generated)
-                reconstruction_metrics_generated_all_runs = np.array(reconstruction_metrics_generated_all_runs)
-
-                if verbose:
-                    # Create a DataFrame
-                    df = pd.DataFrame(gt_sources_astro, columns=casa_columns)
-                    display(df)
-
-                    # Create a DataFrame
-                    if sources_from_generated is not None:
-                        df = pd.DataFrame(sources_from_generated, columns=astropy_columns+["diffusion_idx",])
-                        display(df)
-                    else:
-                        print("No sources from generated")
-
-                    # Create a DataFrame
-                    if sources_from_true is not None:
-                        df = pd.DataFrame(sources_from_true, columns=astropy_columns)
-                        display(df)
-                    else:
-                        print("No sources from true")
-
-                    df = pd.DataFrame(reconstruction_metrics_generated_all_runs, columns=reconstruction_columns + ["diffusion_idx",])
-
-                if verbose or visualization:
-                    plot_generated_images(
-                        true_trasnform(im),
-                        true_trasnform(gen_im_astro),
-                        noisy_im,
-                        uncertainty,
-                        sources=[sources_from_true_pix, sources_from_generated_pix, gt_sources],
-                        #sources=[gt_sources*gen_im.shape[1]/512, sources_from_true, gt_sources],
-                        save_fig=save_fig,
-                        save_name=f"{save_folder}/sample_{partition}_{i}{additional_line}.png",
-                    )
-                    print("=============================================================================================")
-                if len(sources_from_generated_all_runs) > 0:
-                    sources_from_generated_all_runs = np.vstack(sources_from_generated_all_runs)
-                else:
-                    sources_from_generated_all_runs = None
-
-                data["predicted_sources"] =  add_column_i(sources_from_generated_all_runs, i)
-                data["predicted_sources_from_true"] = add_column_i(sources_from_true, i)
-                data["gt_sources"] = add_column_i(gt_sources_astro, i)
-                data["reconstruction_metrics"] = add_column_i(reconstruction_metrics_generated_all_runs, i)
                 return data
 
+        if SNR_fixed is not None and SNR_normalized:
+            if all(np.around(round_custom(true_sources[:, 3].reshape(-1, 1)), decimals=ROUND_SNR) != SNR_fixed):
+                data["fn"] = 0
+                # in this case it should not contribute to fn as the whole image is excluded
+                # print(np.around(true_sources[:,3].reshape(-1,1), decimals=ROUND_SNR))
+                return data
 
-        def test(
+        if verbose or visualization:
+            print("============================================FINAL============================================")
+            print(i)
+
+        # get pixel true coordinates
+        wcs = self.load_wcs(key)
+
+        gt_sources = actro_to_pix(true_sources, wcs)
+
+        gt_sources_astro = np.hstack(
+            (
+                true_sources[:, :2],
+                true_sources[:, 4].reshape(-1, 1),  # flux
+                true_sources[:, 2].reshape(-1, 1),  # SNR
+                true_sources[:, 3].reshape(-1, 1),  # SNR normalized
+                0.5 * (true_sources[:, 5].reshape(-1, 1) + true_sources[:, 6].reshape(-1, 1)),  # major
+                true_sources[:, 6].reshape(-1, 1),  # nimor
+            )
+        )
+
+        true_sources = true_sources[(gt_sources[:, 0] >= 0) & (gt_sources[:, 0] <= 512) &
+                                    (gt_sources[:, 1] >= 0) & (gt_sources[:, 1] <= 512)]
+        gt_sources_astro = gt_sources_astro[(gt_sources[:, 0] >= 0) & (gt_sources[:, 0] <= 512) &
+                                            (gt_sources[:, 1] >= 0) & (gt_sources[:, 1] <= 512)]
+
+        gen_ims = []
+        sources_from_generated_all_runs = []
+        reconstruction_metrics_generated_all_runs = []
+
+        for j in range(repeat_images):
+            gen_im = self.generated_images[i + j]
+            gen_im = gen_im[:, :, 0]
+            gen_im = im_reshape(gen_im)
+            if np.max(true_itrasnform(gen_im, self.power)) < 1e-10:
+                continue
+
+            # per image detection cycle
+
+            if apply_itransform:
+                gen_im_astro = true_itrasnform(gen_im, self.power)
+
+            sources_from_generated = image_to_sources(gen_im_astro)
+            sources_from_generated = pix_to_astro(sources_from_generated, wcs)
+            # adding column for j th run of diffusion model
+            sources_from_generated = add_column_i(sources_from_generated, j)
+
+            if sources_from_generated is not None:
+                sources_from_generated_all_runs.append(sources_from_generated)
+
+            reconstruction_metrics_generated = compute_reconstruction_metrics_from_im(gen_im_astro, im, power=self.runs_per_sample)
+            reconstruction_metrics_generated = reconstruction_metrics_generated + [j, ]
+            reconstruction_metrics_generated_all_runs.append(reconstruction_metrics_generated)
+
+            gen_ims.append(gen_im)
+        if len(gen_ims) == 0:
+            gen_ims = [gen_im, ]
+
+        ims_array = np.array(gen_ims)  # convert list to numpy array
+        gen_im = aggregate_images(ims_array, aggregation=aggr)
+        uncertainty = np.std(ims_array, axis=0)  # /np.mean(ims_array, axis=0)
+
+        if apply_itransform:
+            gen_im_astro = true_itrasnform(gen_im, self.power)
+
+        sources_from_true_pix = image_to_sources(im)
+        sources_from_true = pix_to_astro(sources_from_true_pix, wcs)
+
+        sources_from_generated_pix = image_to_sources(gen_im_astro)
+        sources_from_generated = pix_to_astro(sources_from_generated_pix, wcs)
+
+        # -1 to flag that it is aggregated
+        sources_from_generated = add_column_i(sources_from_generated, -1)
+
+        if sources_from_generated is not None:
+            sources_from_generated_all_runs.append(sources_from_generated)
+
+        reconstruction_metrics_generated = compute_reconstruction_metrics_from_im(gen_im_astro, im, verbose=False, power=self.runs_per_sample)
+        reconstruction_metrics_generated = reconstruction_metrics_generated + [-1, ]
+        reconstruction_metrics_generated_all_runs.append(reconstruction_metrics_generated)
+        reconstruction_metrics_generated_all_runs = np.array(reconstruction_metrics_generated_all_runs)
+
+        if verbose:
+            # Create a DataFrame
+            df = pd.DataFrame(gt_sources_astro, columns=casa_columns)
+            display(df)
+
+            # Create a DataFrame
+            if sources_from_generated is not None:
+                df = pd.DataFrame(sources_from_generated, columns=astropy_columns + ["diffusion_idx", ])
+                display(df)
+            else:
+                print("No sources from generated")
+
+            # Create a DataFrame
+            if sources_from_true is not None:
+                df = pd.DataFrame(sources_from_true, columns=astropy_columns)
+                display(df)
+            else:
+                print("No sources from true")
+
+            df = pd.DataFrame(reconstruction_metrics_generated_all_runs,
+                              columns=reconstruction_columns + ["diffusion_idx", ])
+
+        if verbose or visualization:
+            plot_generated_images(
+                true_trasnform(im, self.power),
+                true_trasnform(gen_im_astro, self.power),
+                noisy_im,
+                uncertainty,
+                sources=[sources_from_true_pix, sources_from_generated_pix, gt_sources],
+                # sources=[gt_sources*gen_im.shape[1]/512, sources_from_true, gt_sources],
+                save_fig=save_fig,
+                save_name=f"{save_folder}/sample_{partition}_{i}{additional_line}.png",
+            )
+            print("=============================================================================================")
+        if len(sources_from_generated_all_runs) > 0:
+            sources_from_generated_all_runs = np.vstack(sources_from_generated_all_runs)
+        else:
+            sources_from_generated_all_runs = None
+
+        data["predicted_sources"] = add_column_i(sources_from_generated_all_runs, i//self.runs_per_sample)
+        data["predicted_sources_from_true"] = add_column_i(sources_from_true, i//self.runs_per_sample)
+        data["gt_sources"] = add_column_i(gt_sources_astro, i//self.runs_per_sample)
+        data["reconstruction_metrics"] = add_column_i(reconstruction_metrics_generated_all_runs, i//self.runs_per_sample)
+        return data
+
+    def test(
+            self,
             nb_sources=None,
-            repeat_images=runs_per_sample,
             verbose=False,
             visualization=False,
             apply_itransform=True,
@@ -647,288 +826,101 @@ def main(folders, dataset_folder, runs_per_sample, image_size = 512):
             plot_brightness=False,
             SNR_normalized=False,
             aggr="median",
-        ):
+    ):
 
-            predicted_sources = []
-            gt_sources = []
-            predicted_sources_from_true = []
-            reconstruction_metrics = []
+        predicted_sources = []
+        gt_sources = []
+        predicted_sources_from_true = []
+        reconstruction_metrics = []
 
-            data = {}
+        data = {}
 
-            for i in tqdm.tqdm(range(0,len(test_images), repeat_images)):#
-                data = run_test_experiment(
-                    i,
-                    nb_sources,
-                    repeat_images,
-                    verbose,
-                    visualization,
-                    apply_itransform,
-                    SNR_fixed,
-                    plot_brightness,
-                    SNR_normalized=SNR_normalized,
-                    aggr=aggr
-                )
+        for i in tqdm.tqdm(range(0, len(self.images), self.runs_per_sample)):  #
+            data = self.run_test_experiment(
+                i,
+                nb_sources,
+                verbose,
+                visualization,
+                apply_itransform,
+                SNR_fixed,
+                plot_brightness,
+                SNR_normalized=SNR_normalized,
+                aggr=aggr
+            )
 
-                if not isinstance(data, dict):
-                    print(i)
-                    continue
-                else:
-                    pass
-
-                if data["predicted_sources"] is not None and len(data["predicted_sources"]) > 0:
-                    predicted_sources.append(data["predicted_sources"])
-                if data["predicted_sources_from_true"] is not None and len(data["predicted_sources_from_true"]) > 0:
-                    predicted_sources_from_true.append(data["predicted_sources_from_true"])
-                if data["gt_sources"] is not None and len(data["gt_sources"]) > 0:
-                    gt_sources.append(data["gt_sources"])
-
-                reconstruction_metrics.append(data["reconstruction_metrics"])
-            if len(predicted_sources) > 0:
-                predicted_sources = np.vstack(predicted_sources,)
-            predicted_sources_from_true = np.vstack(predicted_sources_from_true)
-            gt_sources = np.vstack(gt_sources)
-            reconstruction_metrics = np.vstack(reconstruction_metrics)
-
-
-            data["predicted_sources"]= predicted_sources
-            data["predicted_sources_from_true"]= predicted_sources_from_true
-            data["gt_sources"]= gt_sources
-            data["reconstruction_metrics"]= reconstruction_metrics
-
-            return data
-
-
-
-
-        def compute_localization(current, filtering_for_fp=None, verbose=False):
-            # Count the number of NaNs in each column where sources detected - false positive
-            if filtering_for_fp is None:
-                fp = current[["flux"]].isna().any(axis=1).sum()
-            else:
-                fp = current[["flux"]][filtering_for_fp].isna().any(axis=1).sum()
-
-            # Count the number of NaNs in column diff_idx in results - false negative
-            fn = current[["area_predicted"]].isna().any(axis=1).sum()
-            tp = current[["flux","area_predicted"]].notna().all(axis=1).sum()
-            if verbose:
-                print(fp, tp, fn)
-                print("purity=", tp/(tp+fp))
-                print("completeness=", tp/(tp+fn))
-            return tp, fp, fn
-
-        def merge_pd_frames(gt_sources_, predicted_sources_, verbose=False):
-            # Threshold for distance
-            eps = 5e-5
-
-            predicted_sources = predicted_sources_.copy()
-            predicted_sources['index'] = predicted_sources.index
-
-            gt_sources = gt_sources_.copy()
-            gt_sources['index'] = gt_sources.index
-
-            # Dataframe to store the result
-            columns = list(gt_sources.columns) + [col + '_predicted' for col in predicted_sources.columns]
-            result = pd.DataFrame(columns=columns)
-
-            # Loop through each unique image_idx in gt_sources
-            for image_idx in set(gt_sources['image_idx']):
-                # Filter data for the current image_idx
-                gt_filtered = gt_sources[gt_sources['image_idx'] == image_idx].reset_index(drop=True)
-                pred_filtered = predicted_sources[predicted_sources['image_idx'] == image_idx].reset_index(drop=True)
-                if verbose:
-                    print(image_idx)
-                    display(gt_filtered)
-                    display(pred_filtered)
-
-                # Check if either gt_filtered or pred_filtered is empty
-                if len(gt_filtered) == 0 or len(pred_filtered) == 0:
-                    # Append rows from gt_filtered or pred_filtered with no match
-                    for i in range(len(gt_filtered)):
-                        row = pd.concat([gt_filtered.iloc[i], pd.Series([np.nan]*len(predicted_sources.columns), index=[col + '_predicted' for col in predicted_sources.columns])])
-                        result = result.append(row, ignore_index=True)
-                    for j in range(len(pred_filtered)):
-                        row = pd.concat([pd.Series([np.nan]*len(gt_sources.columns), index=gt_sources.columns), pred_filtered.iloc[j].add_suffix('_predicted')])
-                        result = result.append(row, ignore_index=True)
-                else:
-                    # Compute squared differences for ra and dec
-                    ra_diff = (gt_filtered['ra'].values[:, np.newaxis] - pred_filtered['ra'].values) ** 2
-                    dec_diff = (gt_filtered['dec'].values[:, np.newaxis] - pred_filtered['dec'].values) ** 2
-
-                    # Compute squared distances
-                    squared_distances = ra_diff + dec_diff
-
-                    # Find the closest neighbor for each point in gt_filtered
-                    closest_indices = np.argmin(squared_distances, axis=1)
-                    closest_distances = squared_distances[np.arange(len(gt_filtered)), closest_indices]
-
-                    # Match points in gt_filtered to their closest neighbors in pred_filtered
-                    for i in range(len(gt_filtered)):
-                        # Check if the closest neighbor is within the threshold
-                        if closest_distances[i] < eps ** 2:
-                            # Join the matched rows
-                            row = pd.concat([gt_filtered.iloc[i], pred_filtered.iloc[closest_indices[i]].add_suffix('_predicted')])
-                        else:
-                            # Join with NaN for missing values from predicted_sources
-                            row = pd.concat([gt_filtered.iloc[i], pd.Series([np.nan]*len(predicted_sources.columns), index=[col + '_predicted' for col in predicted_sources.columns])])
-
-                        # Append the row to the result dataframe
-                        result = pd.concat([result, pd.DataFrame([row])], ignore_index=True)
-
-                    # Mark the matched rows in pred_filtered as used
-                    pred_filtered_used = pred_filtered.iloc[closest_indices]
-                    pred_filtered_unused = pred_filtered[~pred_filtered.index.isin(pred_filtered_used.index)]
-                    if verbose:
-                        print("matched")
-                        display(pred_filtered_used)
-                        print("unmatched")
-                        display(pred_filtered_unused)
-
-                    # Append unused rows from pred_filtered with no match in gt_filtered
-                    if len(pred_filtered_unused) > 0:
-                        for _, row in pred_filtered_unused.iterrows():
-                            row = pd.concat([pd.Series([np.nan]*len(gt_sources.columns), index=gt_sources.columns), row.add_suffix('_predicted')])
-                            result = pd.concat([result, pd.DataFrame([row])], ignore_index=True)
-
-            # Append remaining rows from predicted_sources with no match in gt_sources
-            indexes = predicted_sources.index.isin(result.index_predicted)
-            unmatched_predicted = predicted_sources[~indexes]
-            indexes = indexes + 0
-
-            unmatched_nb = len(unmatched_predicted)
-
-            if len(unmatched_predicted) > 0:
-                for _, row in unmatched_predicted.iterrows():
-                    row = pd.concat([pd.Series([np.nan]*len(gt_sources.columns), index=gt_sources.columns), row.add_suffix('_predicted')])
-                    result = pd.concat([result, pd.DataFrame([row])], ignore_index=True)
+            if not isinstance(data, dict):
+                print(i)
+                continue
             else:
                 pass
 
+            if data["predicted_sources"] is not None and len(data["predicted_sources"]) > 0:
+                predicted_sources.append(data["predicted_sources"])
+            if data["predicted_sources_from_true"] is not None and len(data["predicted_sources_from_true"]) > 0:
+                predicted_sources_from_true.append(data["predicted_sources_from_true"])
+            if data["gt_sources"] is not None and len(data["gt_sources"]) > 0:
+                gt_sources.append(data["gt_sources"])
 
-            return result, unmatched_nb
+            reconstruction_metrics.append(data["reconstruction_metrics"])
+        if len(predicted_sources) > 0:
+            predicted_sources = np.vstack(predicted_sources, )
+        predicted_sources_from_true = np.vstack(predicted_sources_from_true)
+        gt_sources = np.vstack(gt_sources)
+        reconstruction_metrics = np.vstack(reconstruction_metrics)
 
-        final_metrics = {}
-        final_metrics["mean"] = {}
-        final_metrics["medoid"] = {}
-        final_metrics["median"] = {}
-        for i in range(runs_per_sample):
-            final_metrics[f"individual_{i}"] = {}
-        for i in range(runs_per_sample):
-            final_metrics[f"localized_threshold_{i}"] = {}
+        data["predicted_sources"] = predicted_sources
+        data["predicted_sources_from_true"] = predicted_sources_from_true
+        data["gt_sources"] = gt_sources
+        data["reconstruction_metrics"] = reconstruction_metrics
 
-        for key in final_metrics:
-            final_metrics[key]["resonstruction_metrics"] = {}
+        return data
 
-            final_metrics[key]["tp"] = 0
-            final_metrics[key]["fp"] = 0
-            final_metrics[key]["fn"] = 0
-            final_metrics[key]["purity"] = 0
-            final_metrics[key]["completeness"] = 0
+def aggregate_images(images, aggregation='mean'):
+    if aggregation == 'mean':
+        return np.mean(images, axis=0)
+    if aggregation == 'median':
+        return np.median(images, axis=0)
+    if aggregation == 'medoid':
+        if len(images) == 0:
+            return None
+        n = len(images)
+        # Calculate pairwise distances
+        distances = np.zeros((n, n))
+        for i in range(n):
+            for j in range(n):
+                distances[i, j] = np.linalg.norm(images[i].flatten() - images[j].flatten())
+        # Sum the distances
+        sum_distances = np.sum(distances, axis=1)
+        # Find the index of the medoid image
+        medoid_idx = np.argmin(sum_distances)
+        # Return the medoid image
+        return images[medoid_idx]
+    else:
+        print("Such aggregation method is not implemented:", aggregation)
+        return None
 
-            final_metrics[key]["snr"] = {}
-            final_metrics[key]["snr"]["snrs"] = None
-            final_metrics[key]["snr"]["purity"] = None
-            final_metrics[key]["snr"]["completeness"] = None
-            final_metrics[key]["snr"]["nb_points"] = None
-            final_metrics[key]["snr"]["tp"] = 0
-            final_metrics[key]["snr"]["fp"] = 0
-            final_metrics[key]["snr"]["fn"] = 0
-
-            final_metrics[key]["snrnorm"] = {}
-            final_metrics[key]["snrnorm"]["snr"] = None
-            final_metrics[key]["snrnorm"]["purity"] = None
-            final_metrics[key]["snrnorm"]["completeness"] = None
-            final_metrics[key]["snrnorm"]["nbs"] = None
-            final_metrics[key]["snrnorm"]["tp"] = 0
-            final_metrics[key]["snrnorm"]["fp"] = 0
-            final_metrics[key]["snrnorm"]["fn"] = 0
-
-            final_metrics[key]["of_nbs"] = {}
-            final_metrics[key]["of_nbs"]["purity"] = None
-            final_metrics[key]["of_nbs"]["completeness"] = None
-
-            final_metrics[key]["values"] = None
-
-
-
-
-        def aggregate_images(images, aggregation='mean'):
-            if aggregation == 'mean':
-                return np.mean(images, axis=0)
-            if aggregation == 'median':
-                return np.median(images, axis=0)
-            elif aggregation == 'medoid':
-                if len(images) == 0:
-                    return None
-                n = len(images)
-                # Calculate pairwise distances
-                distances = np.zeros((n, n))
-                for i in range(n):
-                    for j in range(n):
-                        distances[i, j] = np.linalg.norm(images[i].flatten() - images[j].flatten())
-                # Sum the distances
-                sum_distances = np.sum(distances, axis=1)
-                # Find the index of the medoid image
-                medoid_idx = np.argmin(sum_distances)
-                # Return the medoid image
-                return images[medoid_idx]
-            else:
-                print("error", aggregation)
-                return None
-
-
-        res = test(plot_brightness=True,repeat_images=runs_per_sample, verbose=False, aggr="median")
-
-        current_key = "median"
-
-        #reconstruction metrics
-        reconstruction_metrics = pd.DataFrame(res["reconstruction_metrics"], columns=reconstruction_columns+["diff_idx",]+["image_idx",])
-        reconstruction_metrics.to_csv(folder+"/reconstruction_metrics.csv")
-
-        final_metrics[current_key]["reconstruction_metric"] = reconstruction_metrics[reconstruction_metrics["diff_idx"] == -1].to_dict()
-
-        for i in range(runs_per_sample):
-            final_metrics[f"individual_{i}"]["reconstruction_metric"] = reconstruction_metrics[reconstruction_metrics["diff_idx"] == i].to_dict()
-
-        #predicted tables for sources
-
-        predicted_sources = pd.DataFrame(res["predicted_sources"], columns=astropy_columns+["diff_idx",]+["image_idx",])
-        predicted_sources["SNR_estimated"] = predicted_sources["source_sum"]/5e-5
-        predicted_sources["s_min"] = predicted_sources["semiminor_sigma"]
-        predicted_sources["s_max"] = predicted_sources["semimajor_sigma"]
-        #snr normalized
-        beam_major = 0.89
-        beam_minor = 0.82
-        s_min = predicted_sources["s_min"]
-        s_max = predicted_sources["s_max"]
-        predicted_sources["SNR_norm_estimated"] = predicted_sources["SNR_estimated"]*(beam_major*beam_minor)/np.sqrt((beam_major**2+s_max**2)*(beam_minor**2+s_min**2))
-        predicted_sources.to_csv(folder+"/predicted_sources.csv")
-        predicted_sources[predicted_sources["diff_idx"]==-1].to_csv(folder + f"/aggregated_from_{current_key}_predicted_sources.csv")
-
-
-        predicted_sources_from_true = pd.DataFrame(res["predicted_sources_from_true"], columns=astropy_columns+["image_idx",])
-        predicted_sources_from_true.to_csv(folder+"/predicted_sources_from_true.csv")
-
-        gt_sources = pd.DataFrame(res["gt_sources"], columns=casa_columns+["image_idx",])
-        gt_sources.to_csv(folder+"/gt_sources.csv")
-        # In[20]:
-
-
-        def update_dict(filtered_predicted, final_metrics, key):
+def update_dict(
+    filtered_predicted,
+    final_metrics,
+    gt_sources,
+    key
+    ):
             result, unmatched_nb = merge_pd_frames(gt_sources, filtered_predicted)
             index_matched = result.index_predicted[:-unmatched_nb]
+            ##############################
+            # Metrics for entire dataset
+            ##############################
+            metrics_keys = ["purity", "completeness", "f1", "tp", "fp", "fn", "f1", "values"]
 
             tp, fp, fn = compute_localization(result)
             purity, completeness, f1= compute_purity_completeness_f1(tp, fn, fp)
+            values = result.dropna()
 
-            final_metrics[key]["f1"] = f1
-            final_metrics[key]["fp"] = fp
-            final_metrics[key]["tp"] = tp
-            final_metrics[key]["fn"] = fn
-            final_metrics[key]["purity"] = purity
-            final_metrics[key]["completeness"] = completeness
-            final_metrics[key]["values"] = result.dropna()
-
+            for metrics_key in metrics_keys:
+                final_metrics[key][metrics_key] = locals()[metrics_key]
+            ##############################
+            # Per SNR metrics
+            ##############################
             metrics_keys = ["purity", "completeness", "nb_points", "snrs", "tp", "fp", "fn", "f1", "values"]
             metrics_sources_aggregated_per_snr = {metrics_key: [] for metrics_key in metrics_keys}
 
@@ -959,7 +951,9 @@ def main(folders, dataset_folder, runs_per_sample, image_size = 512):
                     metrics_sources_aggregated_per_snr[metrics_key].append(locals()[metrics_key])
 
             final_metrics[key]["snr"] = metrics_sources_aggregated_per_snr.copy()
-
+            ##############################
+            # Per normalized SNR metrics
+            ##############################
             metrics_keys = ["purity", "completeness", "nb_points", "snrs", "tp", "fp", "fn", "f1", "values"]
             metrics_sources_aggregated_per_snr = {metrics_key: [] for metrics_key in metrics_keys}
 
@@ -1022,52 +1016,78 @@ def main(folders, dataset_folder, runs_per_sample, image_size = 512):
             final_metrics[key]["of_nbs"] = metrics_nb_sources
             return final_metrics
 
-        def compute_purity_completeness_f1(tp, fn, fp):
-            purity = compute_metrics(tp, fp)
-            completeness = compute_metrics(tp, fn)
-            if purity == completeness == 0:
-                f1 = 0
-            else:
-                f1 = 2 * completeness * purity / (purity + completeness)
-            return purity, completeness, f1
 
-        def compute_metrics(tp, fp,):
-            if tp + fp != 0:
-                metrics = tp / (tp + fp)
-            else:
-                if tp == 0:
-                    metrics = 1
-                else:
-                    metrics = 0
-            return metrics
+def compute_purity_completeness_f1(tp, fn, fp):
+    purity = compute_metrics(tp, fp)
+    completeness = compute_metrics(tp, fn)
+    if purity == completeness == 0:
+        f1 = 0
+    else:
+        f1 = 2 * completeness * purity / (purity + completeness)
+    return purity, completeness, f1
 
 
+def compute_metrics(tp, fp, ):
+    if tp + fp != 0:
+        metrics = tp / (tp + fp)
+    else:
+        if tp == 0:
+            metrics = 1
+        else:
+            metrics = 0
+    return metrics
 
-        for diff_idx in range(-1, runs_per_sample, 1):
-            if diff_idx == -1:
-                key = current_key
-            else:
-                key= f"individual_{diff_idx}"
+def main(folders, dataset_folder, runs_per_sample, image_size=512, eps=5e-5, partition="test"):
+    for folder in folders:
+        catalog = PredictedCatalog(folder, dataset_folder, runs_per_sample, image_size, eps, partition)
+        reconstruction_columns = ["l2", "l1", "psnr", "ssim"]
 
+        for aggr in ["mean", "medoid", "median"]:
+            current_key = aggr
+
+            final_metrics = initialize_final_metrics(runs_per_sample)
+            res = catalog.test(plot_brightness=True,verbose=False, aggr=current_key)
+
+            #reconstruction metrics
+            reconstruction_metrics = pd.DataFrame(res["reconstruction_metrics"], columns=reconstruction_columns+["diff_idx",]+["image_idx",])
+            reconstruction_metrics.to_csv(folder+f"/{current_key}_reconstruction_metrics.csv")
+
+            final_metrics[current_key]["reconstruction_metric"] = reconstruction_metrics[reconstruction_metrics["diff_idx"] == -1].to_dict()
+
+            #predicted tables for sources
+            predicted_sources = pd.DataFrame(res["predicted_sources"], columns=astropy_columns+["diff_idx",]+["image_idx",])
+            predicted_sources["SNR_estimated"] = predicted_sources["source_sum"]/NOISE_PER_IMAGE
+            predicted_sources["s_min"] = predicted_sources["semiminor_sigma"]
+            predicted_sources["s_max"] = predicted_sources["semimajor_sigma"]
+            #snr normalized
+            beam_major = 0.89
+            beam_minor = 0.82
+            s_min = predicted_sources["s_min"]
+            s_max = predicted_sources["s_max"]
+            predicted_sources["SNR_norm_estimated"] = predicted_sources["SNR_estimated"]*(beam_major*beam_minor)/np.sqrt((beam_major**2+s_max**2)*(beam_minor**2+s_min**2))
+            predicted_sources.to_csv(folder+f"/{current_key}_predicted_sources.csv")
+            predicted_sources[predicted_sources["diff_idx"]==-1].to_csv(folder + f"/{current_key}_predicted_sources.csv")
+
+            predicted_sources_from_true = pd.DataFrame(res["predicted_sources_from_true"], columns=astropy_columns+["image_idx",])
+            predicted_sources_from_true.to_csv(folder+"/predicted_sources_from_true.csv")
+
+            gt_sources = pd.DataFrame(res["gt_sources"], columns=casa_columns + ["image_idx", ])
+            gt_sources.to_csv(folder + "/gt_sources.csv")
+
+            filtered_predicted = predicted_sources[(predicted_sources["diff_idx"] == -1)]
+            final_metrics = update_dict(filtered_predicted, final_metrics, gt_sources, current_key)
+
+        for i in range(runs_per_sample):
+            final_metrics[f"individual_{i}"]["reconstruction_metric"] = reconstruction_metrics[reconstruction_metrics["diff_idx"] == i].to_dict()
+
+        for diff_idx in range(0, runs_per_sample, 1):
+            key= f"individual_{diff_idx}"
             filtered_predicted = predicted_sources[(predicted_sources["diff_idx"] == diff_idx)]
-            final_metrics = update_dict(filtered_predicted, final_metrics, key)
-
-        # Function to cluster points (ra, dec) within each image using DBSCAN
-        def cluster_points(dataframe, image_idx):
-            eps = 5e-5
-            # Filter data for specific image
-            image_data = dataframe[dataframe["image_idx"] == image_idx]
-
-            # Apply DBSCAN
-            clustering = DBSCAN(eps=eps, min_samples=2).fit(image_data[['ra', 'dec']])
-            image_data = image_data.copy()
-            image_data['cluster'] = clustering.labels_
-
-            return image_data
+            final_metrics = update_dict(filtered_predicted, final_metrics, gt_sources, key)
 
         # Apply the function for each image_idx and concat the result
         try:
-            clustered_data = pd.concat([cluster_points(predicted_sources, image_idx) for image_idx in predicted_sources["image_idx"].unique()])
+            clustered_data = pd.concat([cluster_points(predicted_sources, image_idx, eps) for image_idx in predicted_sources["image_idx"].unique()])
         except ValueError:
             return
 
@@ -1109,58 +1129,10 @@ def main(folders, dataset_folder, runs_per_sample, image_size = 512):
         for counts in range(1, runs_per_sample, 1):
 
             key= f"localized_threshold_{counts}"
-
             aggregated_sources_filtered = aggregated_sources[aggregated_sources["diff_idx_count"] > counts]
-            final_metrics = update_dict(aggregated_sources_filtered, final_metrics, key)
-
-
-        for aggr in ["mean", "medoid"]:
-            diff_idx = -1
-
-            key= aggr
-
-            res = test(plot_brightness=True,repeat_images=runs_per_sample, verbose=False, aggr=key)
-
-            #reconstruction metrics
-            reconstruction_metrics = pd.DataFrame(res["reconstruction_metrics"], columns=reconstruction_columns+["diff_idx",]+["image_idx",])
-
-            final_metrics[key]["reconstruction_metric"] = reconstruction_metrics[reconstruction_metrics["diff_idx"] == -1].to_dict()
-
-            for i in range(runs_per_sample):
-                final_metrics[f"individual_{i}"]["reconstruction_metric"] = reconstruction_metrics[reconstruction_metrics["diff_idx"] == i].to_dict()
-
-            #predicted tables for sources
-
-            predicted_sources = pd.DataFrame(res["predicted_sources"], columns=astropy_columns+["diff_idx",]+["image_idx",])
-            predicted_sources["SNR_estimated"] = predicted_sources["source_sum"]/5e-5
-            predicted_sources["s_min"] = predicted_sources["semiminor_sigma"]
-            predicted_sources["s_max"] = predicted_sources["semimajor_sigma"]
-            #snr normalized
-            beam_major = 0.89
-            beam_minor = 0.82
-            s_min = predicted_sources["s_min"]
-            s_max = predicted_sources["s_max"]
-            predicted_sources["SNR_norm_estimated"] = predicted_sources["SNR_estimated"]*(beam_major*beam_minor)/np.sqrt((beam_major**2+s_max**2)*(beam_minor**2+s_min**2))
-
-            predicted_sources[predicted_sources["diff_idx"]==-1].to_csv(folder + f"/aggregated_from_{key}_predicted_sources.csv")
-
-            gt_sources = pd.DataFrame(res["gt_sources"], columns=casa_columns+["image_idx",])
-
-            aggregated_sources_filtered = predicted_sources[predicted_sources["diff_idx"]==diff_idx]
-            final_metrics = update_dict(aggregated_sources_filtered, final_metrics, key)
+            final_metrics = update_dict(aggregated_sources_filtered, final_metrics, gt_sources, key)
 
         np.save(f"{folder}/final_metrics.npy", final_metrics)
-
-
-def compute_batch_nbs(folder):
-    file_prefix = "batch="
-    file_suffix = "_test_dirty_noisy.npy"
-    all_files = [f for f in os.listdir(folder) if f.startswith(file_prefix) and f.endswith(file_suffix)]
-    # Extract batch numbers
-    batch_numbers = [int(f[len(file_prefix):-len(file_suffix)]) for f in all_files]
-    batch_numbers.sort()
-    return batch_numbers
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
