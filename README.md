@@ -4,7 +4,7 @@ This repository contains the implementation of the Conditional Denoising Diffusi
 
 ## Data Preparation
 
-The code requires a specific dataset format. For a fast look, please, see the notebook [Data - Fast Guide]([mhttps://github.com/MariiaDrozdova/diffusion-for-sources-characterisation/blob/main/Data%20-%20Fast%20Guide.ipynb]). An example of this format can be found in `example_data/toy_data`. Each image should be saved as a separate .npy file. Dirty images are stored in the `dirty` folder, while sky model images are in the `true` folder.
+The code requires a specific dataset format. For a fast look, please, see the notebook [Data - Fast Guide](https://github.com/MariiaDrozdova/diffusion-for-sources-characterisation/blob/main/Data%20-%20Fast%20Guide.ipynb). An example of this format can be found in `example_data/toy_data`. Each image should be saved as a separate .npy file. Dirty images are stored in the `dirty` folder, while sky model images are in the `true` folder.
 
 For real data testing (datasets without ground truth), the dataset folder name should include `real_data`. An example can be found at `example_data/toy_real_data`.
 
