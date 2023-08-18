@@ -52,5 +52,6 @@ For the aggregation detect-aggregate method (detailed in our paper), when `consi
 ## Contact
 
 For any questions regarding dataset used in the paper please contact Omkar Beit at [omkar.bait@unige.ch](mailto:omkar.bait@unige.ch).
+
 For any questions regarding paper and code please contact Mariia Drozdova at [mariia.drozdova@unige.ch](mailto:mariia.drozdova@unige.ch).
 
