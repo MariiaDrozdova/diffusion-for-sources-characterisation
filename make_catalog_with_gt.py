@@ -547,7 +547,7 @@ class PredictedCatalog:
 
     def _compute_batch_nbs(self):
         file_prefix = "batch="
-        file_suffix = "_test_dirty_noisy.npy"
+        file_suffix = f"_{self.partition}_dirty_noisy.npy"
         all_files = [f for f in os.listdir(self.folder) if f.startswith(file_prefix) and f.endswith(file_suffix)]
         # Extract batch numbers
         batch_numbers = [int(f[len(file_prefix):-len(file_suffix)]) for f in all_files]
@@ -655,12 +655,17 @@ class PredictedCatalog:
             SNR_normalized=False,
             aggr="median",
     ):
-        # corresponding index from fits name
-        sky_index = self.sky_indexes[i]
-        key = self.sky_keys[sky_index]
-        true_sources = np.array(self.snr_extended[key])
-        im = np.load(self.true_folder + "/" + self.noisy_im_filenames[sky_index])
-        im = np.nan_to_num(im)
+        sky_index = int(self.sky_indexes[i][-9:-4])
+        try:
+            key = self.sky_keys[sky_index]
+            true_sources = np.array(self.snr_extended[key])
+            im = np.load(self.true_folder + "/" + self.noisy_im_filenames[sky_index])
+            im = np.nan_to_num(im)
+        except:
+            key = None
+            true_sources = []
+            im = np.zeros((512,512))
+
         noisy_im = im_reshape(self.noisy_input[i])  # np.load(noisy_folder + "/" + noisy_im_filenames[sky_index])
         repeat_images = self.runs_per_sample
         save_folder = self.folder
@@ -697,23 +702,27 @@ class PredictedCatalog:
         # get pixel true coordinates
         wcs = self.load_wcs(key)
 
-        gt_sources = actro_to_pix(true_sources, wcs)
+        if len(true_sources) > 0:
+            gt_sources = actro_to_pix(true_sources, wcs)
 
-        gt_sources_astro = np.hstack(
-            (
-                true_sources[:, :2],
-                true_sources[:, 4].reshape(-1, 1),  # flux
-                true_sources[:, 2].reshape(-1, 1),  # SNR
-                true_sources[:, 3].reshape(-1, 1),  # SNR normalized
-                0.5 * (true_sources[:, 5].reshape(-1, 1) + true_sources[:, 6].reshape(-1, 1)),  # major
-                true_sources[:, 6].reshape(-1, 1),  # nimor
+            gt_sources_astro = np.hstack(
+                (
+                    true_sources[:, :2],
+                    true_sources[:, 4].reshape(-1, 1),  # flux
+                    true_sources[:, 2].reshape(-1, 1),  # SNR
+                    true_sources[:, 3].reshape(-1, 1),  # SNR normalized
+                    0.5 * (true_sources[:, 5].reshape(-1, 1) + true_sources[:, 6].reshape(-1, 1)),  # major
+                    true_sources[:, 6].reshape(-1, 1),  # nimor
+                )
             )
-        )
 
-        true_sources = true_sources[(gt_sources[:, 0] >= 0) & (gt_sources[:, 0] <= 512) &
-                                    (gt_sources[:, 1] >= 0) & (gt_sources[:, 1] <= 512)]
-        gt_sources_astro = gt_sources_astro[(gt_sources[:, 0] >= 0) & (gt_sources[:, 0] <= 512) &
-                                            (gt_sources[:, 1] >= 0) & (gt_sources[:, 1] <= 512)]
+            true_sources = true_sources[(gt_sources[:, 0] >= 0) & (gt_sources[:, 0] <= 512) &
+                                        (gt_sources[:, 1] >= 0) & (gt_sources[:, 1] <= 512)]
+            gt_sources_astro = gt_sources_astro[(gt_sources[:, 0] >= 0) & (gt_sources[:, 0] <= 512) &
+                                                (gt_sources[:, 1] >= 0) & (gt_sources[:, 1] <= 512)]
+        else:
+            gt_sources_astro = None
+            gt_sources = None
 
         gen_ims = []
         sources_from_generated_all_runs = []
@@ -723,8 +732,8 @@ class PredictedCatalog:
             gen_im = self.generated_images[i + j]
             gen_im = gen_im[:, :, 0]
             gen_im = im_reshape(gen_im)
-            if np.max(true_itrasnform(gen_im, self.power)) < 1e-10:
-                continue
+            #if np.max(true_itrasnform(gen_im, self.power)) < 1e-10:
+            #    continue
 
             # per image detection cycle
 
@@ -1040,12 +1049,10 @@ def main(folders, dataset_folder, runs_per_sample, image_size=512, eps=5e-5, par
     for folder in folders:
         catalog = PredictedCatalog(folder, dataset_folder, runs_per_sample, image_size, eps, partition)
         reconstruction_columns = ["l2", "l1", "psnr", "ssim"]
-
+        final_metrics = initialize_final_metrics(runs_per_sample)
         for aggr in ["mean", "medoid", "median"]:
             current_key = aggr
-
-            final_metrics = initialize_final_metrics(runs_per_sample)
-            res = catalog.test(plot_brightness=True,verbose=False, aggr=current_key)
+            res = catalog.test(plot_brightness=False,verbose=False, aggr=current_key, )
 
             #reconstruction metrics
             reconstruction_metrics = pd.DataFrame(res["reconstruction_metrics"], columns=reconstruction_columns+["diff_idx",]+["image_idx",])

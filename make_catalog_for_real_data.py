@@ -170,14 +170,14 @@ def image_to_sources(
         std_const = 5
 
     if image_size == 512:
-        sigma_clipped_stats_sigma = 2  # 25.0#10.0
+        sigma_clipped_stats_sigma = 10  # 25.0#10.0
         detect_npixels = 10  # detect_npixels
         deblend_sources_npixels = 10
-        std_const = 120  # 12
+        std_const = 12
 
     # Calculate the threshold for source detection
     mean, median, std = sigma_clipped_stats(image, sigma=sigma_clipped_stats_sigma)
-    threshold = (std_const * std)
+    threshold = np.mean(image) + (std_const * std)
 
     # Detect the sources in the image
     segm = detect_sources(image, threshold, npixels=detect_npixels)
@@ -463,6 +463,23 @@ def plot_generated_images(
         cbar.formatter.set_powerlimits((-4, 4))
         cbar.ax.yaxis.set_offset_position('left')
         cbar.update_ticks()
+    else:
+        axes[1].set_title("noisy dirty image")
+        im0 = axes[1].imshow(artificial_dirty_im)
+        if true_sources is not None:
+            true_sources = true_sources[(true_sources[:, 0] >= 0) & (true_sources[:, 0] <= 512) &
+                                        (true_sources[:, 1] >= 0) & (true_sources[:, 1] <= 512)]
+            axes[1].scatter(true_sources[:, 0], true_sources[:, 1], s=90, c='none', marker="o", edgecolor='r',
+                            linewidths=1)
+        axes[1].set_xticks([])
+        axes[1].set_yticks([])
+        cbar = plt.colorbar(im0, ax=axes[1])
+        # Set the colorbar tick format
+        cbar.formatter = ticker.ScalarFormatter(useMathText=True)
+        cbar.formatter.set_powerlimits((-4, 4))
+        cbar.ax.yaxis.set_offset_position('left')
+        cbar.update_ticks()
+
     if clean_sources is not None:
         axes[1].scatter(clean_sources[:, 0], clean_sources[:, 1], s=90, c='none', marker="o", edgecolor='r',
                         linewidths=1)
@@ -508,7 +525,7 @@ def plot_generated_images(
     if save_fig:
         plt.savefig(save_name)
     else:
-        plt.show()
+        plt.close()
 def round_custom(x):
     return np.round(x * 2) / 2
 
@@ -639,7 +656,13 @@ class PredictedCatalog:
         return header
 
     def load_wcs(self, key):
-        header = self.load_header(key)
+        path = key
+
+        # Open the FITS file
+        with fits.open(path) as hdulist:
+            header = hdulist[0].header
+
+        # Extract WCS information from the header
         wcs = WCS(header)
         return wcs
 
@@ -653,8 +676,8 @@ class PredictedCatalog:
             aggr="median",
     ):
         # corresponding index from fits name
-        sky_index = self.sky_indexes[i]
-        key = self.sky_keys[sky_index]
+        key = self.sky_indexes[i]
+        #key = self.sky_keys[sky_index]
         noisy_im = im_reshape(self.noisy_input[i])  # np.load(noisy_folder + "/" + noisy_im_filenames[sky_index])
         repeat_images = self.runs_per_sample
         save_folder = self.folder
@@ -681,8 +704,8 @@ class PredictedCatalog:
             gen_im = self.generated_images[i + j]
             gen_im = gen_im[:, :, 0]
             gen_im = im_reshape(gen_im)
-            if np.max(true_itrasnform(gen_im, self.power)) < 1e-10:
-                continue
+            #if np.max(true_itrasnform(gen_im, self.power)) < 1e-10:
+            #    continue
 
             # per image detection cycle
 
@@ -954,13 +977,9 @@ def compute_metrics(tp, fp, ):
 def main(folders, dataset_folder, runs_per_sample, image_size=512, eps=5e-5, partition="test", consistent_ra_dec=False):
     for folder in folders:
         catalog = PredictedCatalog(folder, dataset_folder, runs_per_sample, image_size, eps, partition)
-        reconstruction_columns = ["l2", "l1", "psnr", "ssim"]
-
         for aggr in ["mean", "medoid", "median"]:
             current_key = aggr
-
-            final_metrics = initialize_final_metrics(runs_per_sample)
-            res = catalog.test(plot_brightness=True,verbose=False, aggr=current_key)
+            res = catalog.test(plot_brightness=False,verbose=False, aggr=current_key)
 
             #predicted tables for sources
             predicted_sources = pd.DataFrame(res["predicted_sources"], columns=astropy_columns+["diff_idx",]+["image_idx",])
