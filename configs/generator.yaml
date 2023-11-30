@@ -10,7 +10,7 @@ ema_rate: 0.999
 lr: 1e-4
 wd: "0"
 
-fine_tune_from:
+fine_tune_from: lightning_logs/CASA_power2/best_epoch=237_step=99960.ckpt
 schedule_sampler: uniform
 
 model:
